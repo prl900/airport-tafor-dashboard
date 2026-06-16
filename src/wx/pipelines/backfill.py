@@ -143,6 +143,35 @@ def nwp(
 
 
 @app.command()
+def compare(
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+) -> None:
+    """Generate baseline candidate TAFs and score them against the official TAFs."""
+    from wx.ai.compare import comparison, run_all_candidates
+
+    icaos = station or None
+    with get_connection() as con:
+        counts = run_all_candidates(con, icaos)
+        console.print(f"[cyan]Candidate rows scored:[/] {counts}")
+        targets = icaos or [r[0] for r in con.execute(
+            "SELECT DISTINCT icao FROM verification_hourly").fetchall()]
+        for icao in targets:
+            table = Table(title=f"{icao}: forecaster comparison (higher score = better)")
+            for c in ("Forecaster", "Mean score", "POD", "FAR", "HSS", "n"):
+                table.add_column(c, justify="right")
+            for row in comparison(con, icao):
+                table.add_row(
+                    row["profile"],
+                    f"{row['mean_weighted_score']:.3f}" if row["mean_weighted_score"] else "—",
+                    f"{row['POD']:.2f}" if row["POD"] is not None else "—",
+                    f"{row['FAR']:.2f}" if row["FAR"] is not None else "—",
+                    f"{row['HSS']:.2f}" if row["HSS"] is not None else "—",
+                    str(row["n"]),
+                )
+            console.print(table)
+
+
+@app.command()
 def status() -> None:
     """Show row counts across the pipeline tables."""
     with get_connection(read_only=True) as con:

@@ -19,15 +19,21 @@ def _outcomes(db, where: str, params: list) -> list[str]:
     return [r[0] for r in db.fetchall()]
 
 
+# The official TAF is stored under this profile; candidate forecasters use their
+# own profile names, so headline stats must filter to the official rows.
+OFFICIAL = "categorical"
+
+
 @router.get("/summary")
 def summary(db: duckdb.DuckDBPyConnection = Depends(get_db)) -> list[dict]:
-    """Per-airport IFR-event skill summary (POD/FAR/CSI/HSS) over all stored TAFs."""
+    """Per-airport IFR-event skill summary (POD/FAR/CSI/HSS) for the official TAFs."""
     icaos = [r[0] for r in db.execute(
-        "SELECT DISTINCT icao FROM verification_hourly ORDER BY icao"
+        "SELECT DISTINCT icao FROM verification_hourly WHERE scoring_profile = ? ORDER BY icao",
+        [OFFICIAL],
     ).fetchall()]
     out = []
     for icao in icaos:
-        ss = skill_scores(_outcomes(db, "icao = ?", [icao]))
+        ss = skill_scores(_outcomes(db, "icao = ? AND scoring_profile = ?", [icao, OFFICIAL]))
         out.append({"icao": icao, **ss})
     return out
 
@@ -36,7 +42,7 @@ def summary(db: duckdb.DuckDBPyConnection = Depends(get_db)) -> list[dict]:
 def scorecard(icao: str, db: duckdb.DuckDBPyConnection = Depends(get_db)) -> dict:
     """Headline skill + mean element errors + lead-time skill curve for one station."""
     icao = icao.upper()
-    ss = skill_scores(_outcomes(db, "icao = ?", [icao]))
+    ss = skill_scores(_outcomes(db, "icao = ? AND scoring_profile = ?", [icao, OFFICIAL]))
 
     db.execute(
         """
@@ -45,9 +51,9 @@ def scorecard(icao: str, db: duckdb.DuckDBPyConnection = Depends(get_db)) -> dic
                round(avg(abs(wind_err_kt)), 1)   AS wind_mae_kt,
                round(avg(abs(dir_err_deg)), 1)   AS dir_mae_deg,
                round(avg(weighted_score), 3)     AS mean_weighted_score
-        FROM verification_hourly WHERE icao = ?
+        FROM verification_hourly WHERE icao = ? AND scoring_profile = ?
         """,
-        [icao],
+        [icao, OFFICIAL],
     )
     errors = rows_to_dicts(db)[0]
 
@@ -56,14 +62,22 @@ def scorecard(icao: str, db: duckdb.DuckDBPyConnection = Depends(get_db)) -> dic
         SELECT (lead_time_h // 6) * 6 AS lead_bucket,
                round(avg(weighted_score), 3) AS mean_score,
                count(*) AS n
-        FROM verification_hourly WHERE icao = ? AND lead_time_h >= 0
+        FROM verification_hourly WHERE icao = ? AND scoring_profile = ? AND lead_time_h >= 0
         GROUP BY 1 ORDER BY 1
         """,
-        [icao],
+        [icao, OFFICIAL],
     )
     lead_curve = rows_to_dicts(db)
 
     return {"icao": icao, "skill": ss, "errors": errors, "lead_curve": lead_curve}
+
+
+@router.get("/{icao}/comparison")
+def comparison_endpoint(icao: str, db: duckdb.DuckDBPyConnection = Depends(get_db)) -> list[dict]:
+    """Skill per forecaster (official vs candidate baselines) for one station."""
+    from wx.ai.compare import comparison
+
+    return comparison(db, icao.upper())
 
 
 @router.get("/{icao}")

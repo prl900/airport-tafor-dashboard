@@ -15,6 +15,7 @@ export const api = {
     get(`/stations/${icao}/taf?start=${start}&end=${end}`),
   verificationSummary: () => get("/verification/summary"),
   scorecard: (icao) => get(`/verification/${icao}/scorecard`),
+  comparison: (icao) => get(`/verification/${icao}/comparison`),
 };
 
 // Standard aviation flight-category colours.

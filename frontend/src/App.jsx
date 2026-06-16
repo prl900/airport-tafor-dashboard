@@ -3,6 +3,7 @@ import { api } from "./api";
 import SpainMap from "./SpainMap";
 import StationCharts from "./StationCharts";
 import Scorecard from "./Scorecard";
+import Comparison from "./Comparison";
 
 export default function App() {
   const [stations, setStations] = useState([]);
@@ -76,6 +77,7 @@ export default function App() {
               {data.metar.length} obs · {data.taf.length} TAFs in range
             </div>
             <Scorecard icao={selected} />
+            <Comparison icao={selected} />
             {loading ? (
               <div className="loading">Loading…</div>
             ) : (

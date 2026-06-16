@@ -90,7 +90,19 @@ header.topbar input[type="date"] {
 }
 .metric-val { font-size: 19px; font-weight: 650; color: var(--text); }
 .metric-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; letter-spacing: .3px; }
-.empty code, .metric code { font-family: ui-monospace, monospace; color: var(--accent); }
+.empty code, .metric code, .cmp-note code { font-family: ui-monospace, monospace; color: var(--accent); }
+
+table.cmp { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+table.cmp th { text-align: right; color: var(--muted); font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+table.cmp th:first-child, table.cmp td:first-child { text-align: left; }
+table.cmp td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+table.cmp tr.official td { color: var(--text); font-weight: 600; }
+table.cmp tr:not(.official) td:first-child { color: var(--muted); }
+.badge {
+  display: inline-block; margin-left: 8px; font-size: 10px; font-weight: 600;
+  color: #0e1117; background: #2ecc71; border-radius: 4px; padding: 1px 6px; vertical-align: middle;
+}
+.cmp-note { color: var(--muted); font-size: 11.5px; line-height: 1.5; margin: 10px 4px 4px; }
 
 /* MapLibre marker */
 .apt-marker {
