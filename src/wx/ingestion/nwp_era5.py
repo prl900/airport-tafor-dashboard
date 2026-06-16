@@ -14,6 +14,8 @@ METAR/TAF side only.
 
 from __future__ import annotations
 
+import tempfile
+import zipfile
 from datetime import timezone
 from pathlib import Path
 
@@ -29,7 +31,7 @@ DATASET = "reanalysis-era5-single-levels"
 ERA5_VARIABLES = {
     "10m_u_component_of_wind": "u10",
     "10m_v_component_of_wind": "v10",
-    "10m_wind_gust_since_previous_post_processing": "i10fg",
+    "10m_wind_gust_since_previous_post_processing": "fg10",
     "2m_temperature": "t2m",
     "2m_dewpoint_temperature": "d2m",
     "total_cloud_cover": "tcc",
@@ -75,6 +77,25 @@ def download_year(year: int, out_dir: Path | None = None) -> Path:
     return target
 
 
+def load_dataset(path: Path) -> xr.Dataset:
+    """Open an ERA5 download as a single Dataset.
+
+    The new CDS infrastructure returns a ZIP of separate NetCDFs (instantaneous
+    vs accumulated streams) even when ``unarchived`` is requested. Detect that,
+    extract, and merge the members; otherwise open the NetCDF directly.
+    """
+    if not zipfile.is_zipfile(path):
+        return xr.open_dataset(path).load()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(path) as zf:
+            members = [m for m in zf.namelist() if m.endswith(".nc")]
+            zf.extractall(tmp)
+        datasets = [xr.open_dataset(Path(tmp) / m).load() for m in members]
+    # Streams share lat/lon/valid_time; override resolves any attr/coord conflicts.
+    return xr.merge(datasets, compat="override", combine_attrs="drop_conflicts")
+
+
 def _wind_speed_dir(u, v):
     """Speed (m/s) and meteorological 'from' direction (deg) from u/v components."""
     spd = np.hypot(u, v)
@@ -116,7 +137,8 @@ def extract_points(ds: xr.Dataset, stations: list[dict]) -> list[dict]:
         def get(arr, i):
             return None if arr is None else _clean(arr[i])
 
-        gust = conv("i10fg", lambda a: a * MS_TO_KT)
+        gust_short = "fg10" if "fg10" in ds else "i10fg"  # new vs legacy CDS name
+        gust = conv(gust_short, lambda a: a * MS_TO_KT)
         t2m = conv("t2m", lambda a: a - 273.15)
         d2m = conv("d2m", lambda a: a - 273.15)
         tcc, lcc, mcc, hcc = (series(s) for s in ("tcc", "lcc", "mcc", "hcc"))

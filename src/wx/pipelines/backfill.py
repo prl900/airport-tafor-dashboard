@@ -120,9 +120,7 @@ def nwp(
     Requires cdsapi credentials in ~/.cdsapirc. Gridded NetCDF is cached in
     data/era5; nwp_point holds the nearest-gridpoint series per airport.
     """
-    import xarray as xr
-
-    from wx.ingestion.nwp_era5 import download_year, extract_points
+    from wx.ingestion.nwp_era5 import download_year, extract_points, load_dataset
 
     t0, t1 = _utc(start), _utc(end)
     with get_connection() as con:
@@ -134,8 +132,8 @@ def nwp(
         for year in range(t0.year, t1.year + 1):
             console.print(f"  ERA5 {year}: downloading (CDS queue may take minutes)…")
             path = download_year(year)
-            with xr.open_dataset(path) as ds:
-                recs = extract_points(ds, stations)
+            ds = load_dataset(path)
+            recs = extract_points(ds, stations)
             recs = [r for r in recs if t0 <= r["valid_time"] < t1]
             total += repo.store_nwp_points(con, recs)
             console.print(f"  ERA5 {year}: {len(recs)} point-rows")
