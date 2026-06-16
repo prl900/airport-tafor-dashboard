@@ -45,7 +45,7 @@ def _insert_select(con, table: str, df: pd.DataFrame, select_sql: str,
 
 
 _VERIF_COLS = ["taf_forecast_id", "icao", "valid_hour", "lead_time_h", "scoring_profile",
-               "fcst_category", "obs_category", "category_outcome", "wind_err_kt",
+               "fcst_category", "obs_category", "category_outcome", "fcst_prob", "wind_err_kt",
                "dir_err_deg", "temp_err_c", "vis_err_m", "ceiling_err_ft", "weighted_score"]
 
 

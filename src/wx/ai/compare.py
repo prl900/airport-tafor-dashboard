@@ -10,7 +10,7 @@ import duckdb
 from wx.ai.generate import FORECASTERS, Forecaster
 from wx.verification.align import align
 from wx.verification.runner import _load_obs
-from wx.verification.scores import score_hour, skill_scores
+from wx.verification.scores import is_adverse, score_hour, skill_scores
 
 
 def run_candidate(con: duckdb.DuckDBPyConnection, forecaster: Forecaster,
@@ -44,7 +44,7 @@ def run_candidate(con: duckdb.DuckDBPyConnection, forecaster: Forecaster,
             lead_h = int((eh.valid_hour - issued_at).total_seconds() // 3600)
             rows.append((taf_id, icao, eh.valid_hour, lead_h, forecaster.name,
                          s["fcst_category"], s["obs_category"], s["category_outcome"],
-                         s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"],
+                         s["fcst_prob"], s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"],
                          s["vis_err_m"], s["ceiling_err_ft"], s["weighted_score"]))
     return repo.store_verification(con, rows)
 
@@ -54,21 +54,34 @@ def run_all_candidates(con: duckdb.DuckDBPyConnection, icaos: list[str] | None =
 
 
 def comparison(con: duckdb.DuckDBPyConnection, icao: str) -> list[dict]:
-    """Per-profile skill + mean weighted score for one station (official vs candidates)."""
+    """Per-profile categorical skill + probabilistic Brier/BSS for one station.
+
+    Brier/BSS credit hedged (TEMPO/PROB) forecasts properly, so this is the fair
+    'beat the official TAF' view that HSS's strict contingency table misses.
+    """
+    from wx.verification.scores import brier_score, brier_skill_score
+
     profiles = [r[0] for r in con.execute(
         "SELECT DISTINCT scoring_profile FROM verification_hourly WHERE icao = ?", [icao]
     ).fetchall()]
     out = []
     for p in profiles:
-        outcomes = [r[0] for r in con.execute(
-            "SELECT category_outcome FROM verification_hourly WHERE icao = ? AND scoring_profile = ?",
+        rows = con.execute(
+            """SELECT category_outcome, fcst_prob, obs_category, weighted_score
+               FROM verification_hourly WHERE icao = ? AND scoring_profile = ?""",
             [icao, p],
-        ).fetchall()]
-        mean_score = con.execute(
-            "SELECT avg(weighted_score) FROM verification_hourly WHERE icao = ? AND scoring_profile = ?",
-            [icao, p],
-        ).fetchone()[0]
-        label = "official" if p == "categorical" else p
-        out.append({"profile": label, "mean_weighted_score": mean_score, **skill_scores(outcomes)})
-    out.sort(key=lambda d: (d["mean_weighted_score"] or 0), reverse=True)
+        ).fetchall()
+        outcomes = [r[0] for r in rows]
+        probs = [r[1] for r in rows]
+        events = [1 if is_adverse(r[2]) else 0 for r in rows]
+        weights = [r[3] for r in rows if r[3] is not None]
+        out.append({
+            "profile": "official" if p == "categorical" else p,
+            "mean_weighted_score": (sum(weights) / len(weights)) if weights else None,
+            "brier": brier_score(probs, events),
+            "bss": brier_skill_score(probs, events),   # vs climatological base rate
+            **skill_scores(outcomes),
+        })
+    # Rank by Brier skill score (probabilistic) — the fair metric.
+    out.sort(key=lambda d: (d["bss"] if d["bss"] is not None else -1), reverse=True)
     return out

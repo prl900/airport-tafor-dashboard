@@ -80,26 +80,32 @@ def _hourly(valid_from, valid_to):
 
 
 def _hour_climatology(obs):
-    """Per hour-of-day prevailing dict (median vis/ceiling, modal category)."""
+    """Per hour-of-day: prevailing dict (median vis/ceiling, modal category) AND the
+    empirical P(IFR-or-worse) — the latter is the probabilistic climatology reference."""
     from statistics import median, mode
+
+    from wx.verification.scores import is_adverse
 
     buckets: dict[int, dict[str, list]] = {}
     for o in obs:
-        b = buckets.setdefault(o["observed_at"].hour, {"vis": [], "ceil": [], "cat": []})
+        b = buckets.setdefault(o["observed_at"].hour,
+                               {"vis": [], "ceil": [], "cat": [], "adv": [], "n": 0})
         if o["vis_m"] is not None:
             b["vis"].append(o["vis_m"])
         if o["ceiling_ft"] is not None:
             b["ceil"].append(o["ceiling_ft"])
         if o["flight_category"]:
             b["cat"].append(o["flight_category"])
-    clim = {}
+            b["adv"].append(1 if is_adverse(o["flight_category"]) else 0)
+    clim, clim_prob = {}, {}
     for hod, b in buckets.items():
         vis = median(b["vis"]) if b["vis"] else None
         ceil = median(b["ceil"]) if b["ceil"] else None
         cat = mode(b["cat"]) if b["cat"] else flight_category(ceil, vis)
         clim[hod] = {"vis_m": vis, "ceiling_ft": ceil, "wind_spd_kt": None,
                      "wind_dir_deg": None, "flight_category": cat}
-    return clim
+        clim_prob[hod] = (sum(b["adv"]) / len(b["adv"])) if b["adv"] else 0.0
+    return clim, clim_prob
 
 
 def _prevailing_from_obs(o: dict) -> dict:
@@ -131,7 +137,7 @@ def score_profile(con, icao: str, profile: str) -> int:
         return 0
     obs, times = _station_obs(con, icao)
     groups = _groups_by_taf(con, icao) if profile == "categorical" else {}
-    clim = _hour_climatology(obs) if profile == "climatology" else {}
+    clim, clim_prob = _hour_climatology(obs) if profile == "climatology" else ({}, {})
 
     rows = []
     for taf in tafs:
@@ -141,9 +147,13 @@ def score_profile(con, icao: str, profile: str) -> int:
             s = score_hour(eh, o)
             if s is None:
                 continue
+            # climatology emits the empirical hour-of-day adverse frequency (the
+            # probabilistic reference); other profiles use the group/obs-derived prob.
+            fcst_prob = clim_prob.get(eh.valid_hour.hour, 0.0) if profile == "climatology" \
+                else s["fcst_prob"]
             lead_h = int((eh.valid_hour - issued_at).total_seconds() // 3600)
             rows.append((fid, icao, eh.valid_hour, lead_h, profile, s["fcst_category"],
-                         s["obs_category"], s["category_outcome"], s["wind_err_kt"],
+                         s["obs_category"], s["category_outcome"], fcst_prob, s["wind_err_kt"],
                          s["dir_err_deg"], s["temp_err_c"], s["vis_err_m"],
                          s["ceiling_err_ft"], s["weighted_score"]))
     return repo.store_verification(con, rows)

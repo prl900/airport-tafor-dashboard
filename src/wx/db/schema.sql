@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS verification_hourly (
     fcst_category    VARCHAR,
     obs_category     VARCHAR,
     category_outcome VARCHAR,                 -- hit|miss|false_alarm|correct_neg
+    fcst_prob        DOUBLE,                   -- P(IFR-or-worse) for Brier scoring
     wind_err_kt      DOUBLE,
     dir_err_deg      DOUBLE,
     temp_err_c       DOUBLE,

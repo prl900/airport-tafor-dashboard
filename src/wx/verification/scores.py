@@ -13,10 +13,59 @@ from wx.verification.timeline import ExpectedHour
 
 CATEGORY_RANK = {"LIFR": 0, "IFR": 1, "MVFR": 2, "VFR": 3}
 ADVERSE = {"IFR", "LIFR"}  # the verified adverse event
+TEMPO_PROB = 0.4           # implied probability of a bare TEMPO group (no explicit PROB)
 
 
 def is_adverse(cat: str | None) -> bool:
     return cat in ADVERSE
+
+
+def adverse_probability(eh) -> float:
+    """Forecast probability of the IFR-or-worse event for one hour.
+
+    The prevailing forecast is a firm commitment (p=1 if adverse, else 0); a
+    TEMPO/PROB group that mentions an adverse category adds probability mass
+    (PROB30->0.3, PROB40->0.4, bare TEMPO->0.4). This is what lets the Brier score
+    credit a TAF's hedging instead of treating every PROB30 FG as a false alarm.
+    Baselines with only a prevailing state collapse to a deterministic 0/1.
+    """
+    if is_adverse(eh.prevailing.get("flight_category")):
+        return 1.0
+    p = 0.0
+    if getattr(eh, "tempo", None) and is_adverse(eh.tempo.get("flight_category")):
+        p = max(p, TEMPO_PROB)
+    if getattr(eh, "prob", None) and is_adverse(eh.prob.get("flight_category")):
+        pr = eh.prob.get("probability")
+        p = max(p, (pr / 100.0) if pr else TEMPO_PROB)
+    return p
+
+
+def brier_score(probs: list[float], events: list[int]) -> float | None:
+    """Mean squared error of probabilistic forecasts (lower is better)."""
+    pairs = [(p, e) for p, e in zip(probs, events) if p is not None and e is not None]
+    if not pairs:
+        return None
+    return sum((p - e) ** 2 for p, e in pairs) / len(pairs)
+
+
+def brier_skill_score(probs: list[float], events: list[int],
+                      reference_probs: list[float] | None = None) -> float | None:
+    """BSS vs a reference forecast (default: the event's own base rate).
+
+    BSS = 1 - BS / BS_ref. Positive => more skilful than the reference; 0 => equal.
+    """
+    bs = brier_score(probs, events)
+    valid_events = [e for e in events if e is not None]
+    if bs is None or not valid_events:
+        return None
+    if reference_probs is None:
+        base = sum(valid_events) / len(valid_events)        # climatological base rate
+        bs_ref = sum((base - e) ** 2 for e in valid_events) / len(valid_events)
+    else:
+        bs_ref = brier_score(reference_probs, events)
+    if not bs_ref:
+        return None
+    return 1.0 - bs / bs_ref
 
 
 def contingency_outcome(fcst_event: bool, obs_event: bool) -> str:
@@ -88,6 +137,7 @@ def score_hour(eh: ExpectedHour, obs: dict | None) -> dict | None:
         "vis_err_m": err(prev.get("vis_m"), obs.get("vis_m")),
         "ceiling_err_ft": err(prev.get("ceiling_ft"), obs.get("ceiling_ft")),
         "weighted_score": weighted_score(eh, obs_cat),
+        "fcst_prob": adverse_probability(eh),   # P(IFR-or-worse) for the Brier score
     }
 
 

@@ -55,8 +55,8 @@ def score_taf_rows(con: duckdb.DuckDBPyConnection, taf: dict) -> list[tuple]:
         lead_h = int((eh.valid_hour - taf["issued_at"]).total_seconds() // 3600)
         rows.append((taf["id"], taf["icao"], eh.valid_hour, lead_h, s["scoring_profile"],
                      s["fcst_category"], s["obs_category"], s["category_outcome"],
-                     s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"], s["vis_err_m"],
-                     s["ceiling_err_ft"], s["weighted_score"]))
+                     s["fcst_prob"], s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"],
+                     s["vis_err_m"], s["ceiling_err_ft"], s["weighted_score"]))
     return rows
 
 
