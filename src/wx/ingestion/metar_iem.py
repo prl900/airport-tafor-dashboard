@@ -24,24 +24,25 @@ class IemMetarIngester(Ingester):
     def fetch_raw(self, icao: str, start: datetime, end: datetime) -> list[dict]:
         records: list[dict] = []
         for year in range(start.year, end.year + 1):
-            y_start = max(start, datetime(year, 1, 1, tzinfo=timezone.utc))
-            y_end = min(end, datetime(year + 1, 1, 1, tzinfo=timezone.utc))
-            if y_start >= y_end:
-                continue
+            # Always request the FULL calendar year so the per-year cache key holds
+            # the whole year regardless of the requested sub-range; filter afterwards.
+            # (A sub-year request cached under the year key would otherwise poison it.)
+            y0 = datetime(year, 1, 1, tzinfo=timezone.utc)
+            y1 = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
             text = self.fetch(
                 settings.iem_base_url,
                 params={
                     "station": icao,
                     "data": "metar",
-                    "year1": y_start.year, "month1": y_start.month, "day1": y_start.day,
-                    "year2": y_end.year, "month2": y_end.month, "day2": y_end.day,
+                    "year1": y0.year, "month1": 1, "day1": 1,
+                    "year2": y1.year, "month2": 1, "day2": 1,
                     "tz": "Etc/UTC",
                     "format": "onlycomma",
                     "latlon": "no", "missing": "M", "trace": "T",
                 },
                 cache_key=f"iem-metar-{icao}-{year}",
             )
-            records.extend(self._parse_csv(text, icao, y_start, y_end))
+            records.extend(self._parse_csv(text, icao, max(start, y0), min(end, y1)))
         return records
 
     @staticmethod

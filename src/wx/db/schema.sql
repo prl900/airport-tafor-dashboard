@@ -1,6 +1,12 @@
 -- DuckDB schema for the airport TAFOR verification dashboard.
 -- Idempotent: safe to run repeatedly (CREATE ... IF NOT EXISTS).
--- Sequences back the surrogate keys; UNIQUE constraints make ingestion idempotent.
+--
+-- Performance note: DuckDB is columnar/OLAP and its secondary indexes (the ART
+-- structures backing PRIMARY KEY / UNIQUE) are a known weak spot for bulk loads
+-- (per-row maintenance + slow ON CONFLICT). The high-volume tables therefore
+-- carry NO PK/UNIQUE constraints; `id` is just a sequence-backed BIGINT used for
+-- joins (hash joins need no index), and idempotency is enforced by anti-join
+-- dedup at insert time (see wx/db/repositories.py).
 
 INSTALL spatial;
 LOAD spatial;
@@ -18,38 +24,37 @@ CREATE TABLE IF NOT EXISTS stations (
 );
 
 -- ---------------------------------------------------------------------------
--- Raw, immutable, source-tagged messages (re-parseable without re-download)
+-- Raw, immutable, source-tagged messages (re-parseable without re-download).
+-- Dedup key (anti-join): (icao, observed_at|issued_at, source).
 -- ---------------------------------------------------------------------------
 CREATE SEQUENCE IF NOT EXISTS seq_raw_metar START 1;
 CREATE TABLE IF NOT EXISTS raw_metar (
-    id           BIGINT DEFAULT nextval('seq_raw_metar') PRIMARY KEY,
+    id           BIGINT DEFAULT nextval('seq_raw_metar'),
     icao         VARCHAR NOT NULL,
     observed_at  TIMESTAMPTZ NOT NULL,
     raw_text     VARCHAR NOT NULL,
     source       VARCHAR NOT NULL,           -- 'iem' | 'ogimet' | 'aemet'
-    ingested_at  TIMESTAMPTZ NOT NULL,
-    UNIQUE (icao, observed_at, raw_text)
+    ingested_at  TIMESTAMPTZ NOT NULL
 );
 
 CREATE SEQUENCE IF NOT EXISTS seq_raw_taf START 1;
 CREATE TABLE IF NOT EXISTS raw_taf (
-    id           BIGINT DEFAULT nextval('seq_raw_taf') PRIMARY KEY,
+    id           BIGINT DEFAULT nextval('seq_raw_taf'),
     icao         VARCHAR NOT NULL,
     issued_at    TIMESTAMPTZ NOT NULL,
     valid_from   TIMESTAMPTZ,
     valid_to     TIMESTAMPTZ,
     raw_text     VARCHAR NOT NULL,
     source       VARCHAR NOT NULL,           -- 'ogimet' | 'aemet'
-    ingested_at  TIMESTAMPTZ NOT NULL,
-    UNIQUE (icao, issued_at, raw_text)
+    ingested_at  TIMESTAMPTZ NOT NULL
 );
 
 -- ---------------------------------------------------------------------------
--- Parsed METAR observations (canonical SI + derived ceiling/flight category)
+-- Parsed METAR observations. Dedup key: (raw_metar_id).
 -- ---------------------------------------------------------------------------
 CREATE SEQUENCE IF NOT EXISTS seq_metar_obs START 1;
 CREATE TABLE IF NOT EXISTS metar_obs (
-    id              BIGINT DEFAULT nextval('seq_metar_obs') PRIMARY KEY,
+    id              BIGINT DEFAULT nextval('seq_metar_obs'),
     raw_metar_id    BIGINT NOT NULL,
     icao            VARCHAR NOT NULL,
     observed_at     TIMESTAMPTZ NOT NULL,
@@ -62,28 +67,26 @@ CREATE TABLE IF NOT EXISTS metar_obs (
     qnh_hpa         DOUBLE,
     ceiling_ft      INTEGER,
     flight_category VARCHAR,                  -- VFR | MVFR | IFR | LIFR
-    clouds          JSON,                     -- [{cover, base_ft, cb}]
-    weather         JSON,                     -- ['+RA','BR',...]
-    UNIQUE (raw_metar_id)
+    clouds          JSON,
+    weather         JSON
 );
 
 -- ---------------------------------------------------------------------------
--- Parsed TAF: one header + one row per change group
+-- Parsed TAF: header + one row per change group. Dedup key: (raw_taf_id).
 -- ---------------------------------------------------------------------------
 CREATE SEQUENCE IF NOT EXISTS seq_taf_forecast START 1;
 CREATE TABLE IF NOT EXISTS taf_forecast (
-    id           BIGINT DEFAULT nextval('seq_taf_forecast') PRIMARY KEY,
+    id           BIGINT DEFAULT nextval('seq_taf_forecast'),
     raw_taf_id   BIGINT NOT NULL,
     icao         VARCHAR NOT NULL,
     issued_at    TIMESTAMPTZ NOT NULL,
     valid_from   TIMESTAMPTZ,
-    valid_to     TIMESTAMPTZ,
-    UNIQUE (raw_taf_id)
+    valid_to     TIMESTAMPTZ
 );
 
 CREATE SEQUENCE IF NOT EXISTS seq_taf_group START 1;
 CREATE TABLE IF NOT EXISTS taf_group (
-    id               BIGINT DEFAULT nextval('seq_taf_group') PRIMARY KEY,
+    id               BIGINT DEFAULT nextval('seq_taf_group'),
     taf_forecast_id  BIGINT NOT NULL,
     group_type       VARCHAR NOT NULL,        -- BASE|FM|BECMG|TEMPO|PROB30|PROB40|PROB_TEMPO
     probability      INTEGER,
@@ -108,21 +111,21 @@ CREATE TABLE IF NOT EXISTS taf_expected_hourly (
     valid_hour       TIMESTAMPTZ NOT NULL,
     prevailing       JSON,
     tempo            JSON,
-    prob             JSON,
-    PRIMARY KEY (taf_forecast_id, valid_hour)
+    prob             JSON
 );
 
 -- ---------------------------------------------------------------------------
--- Verification results, hourly granularity (rolls up to any aggregation)
+-- Verification results, hourly granularity. Dedup key:
+-- (taf_forecast_id, valid_hour, scoring_profile).
 -- ---------------------------------------------------------------------------
 CREATE SEQUENCE IF NOT EXISTS seq_verification_hourly START 1;
 CREATE TABLE IF NOT EXISTS verification_hourly (
-    id               BIGINT DEFAULT nextval('seq_verification_hourly') PRIMARY KEY,
+    id               BIGINT DEFAULT nextval('seq_verification_hourly'),
     taf_forecast_id  BIGINT NOT NULL,
     icao             VARCHAR NOT NULL,
     valid_hour       TIMESTAMPTZ NOT NULL,
     lead_time_h      INTEGER,
-    scoring_profile  VARCHAR NOT NULL,        -- 'categorical'|'nws_weighted'|'element_rmse'
+    scoring_profile  VARCHAR NOT NULL,        -- 'categorical'|'persistence'|'climatology'|'model:*'
     fcst_category    VARCHAR,
     obs_category     VARCHAR,
     category_outcome VARCHAR,                 -- hit|miss|false_alarm|correct_neg
@@ -131,12 +134,12 @@ CREATE TABLE IF NOT EXISTS verification_hourly (
     temp_err_c       DOUBLE,
     vis_err_m        DOUBLE,
     ceiling_err_ft   DOUBLE,
-    weighted_score   DOUBLE,
-    UNIQUE (taf_forecast_id, valid_hour, scoring_profile)
+    weighted_score   DOUBLE
 );
 
 -- ---------------------------------------------------------------------------
--- NWP point series extracted per station from ERA5 (Phase 3)
+-- NWP point series extracted per station from ERA5 (Phase 3).
+-- Dedup key: (icao, valid_time, source).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS nwp_point (
     icao          VARCHAR NOT NULL,
@@ -153,6 +156,5 @@ CREATE TABLE IF NOT EXISTS nwp_point (
     hcc           DOUBLE,
     cbh_m         DOUBLE,
     tp_mm         DOUBLE,
-    mslp_hpa      DOUBLE,
-    PRIMARY KEY (icao, valid_time, source)
+    mslp_hpa      DOUBLE
 );

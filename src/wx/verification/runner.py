@@ -40,43 +40,30 @@ def _load_obs(con, icao: str, start: datetime, end: datetime) -> list[dict]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def verify_taf(con: duckdb.DuckDBPyConnection, taf: dict) -> int:
-    """Verify one TAF (dict: id, icao, issued_at, valid_from, valid_to). Returns
-    the number of hourly rows written."""
+def score_taf_rows(con: duckdb.DuckDBPyConnection, taf: dict) -> list[tuple]:
+    """Return verification rows (matching repo._VERIF_COLS order) for one TAF."""
     groups = _load_groups(con, taf["id"])
     expected = expand(groups, taf["valid_from"], taf["valid_to"])
     if not expected:
-        return 0
+        return []
     obs = _load_obs(con, taf["icao"], expected[0].valid_hour, taf["valid_to"])
-    aligned = align(expected, obs)
-
     rows = []
-    for eh, o in aligned:
-        scored = score_hour(eh, o)
-        if scored is None:
+    for eh, o in align(expected, obs):
+        s = score_hour(eh, o)
+        if s is None:
             continue
         lead_h = int((eh.valid_hour - taf["issued_at"]).total_seconds() // 3600)
-        rows.append((taf["id"], taf["icao"], eh.valid_hour, lead_h, scored))
-
-    for taf_id, icao, valid_hour, lead_h, s in rows:
-        con.execute(
-            """
-            INSERT INTO verification_hourly
-              (taf_forecast_id, icao, valid_hour, lead_time_h, scoring_profile,
-               fcst_category, obs_category, category_outcome, wind_err_kt, dir_err_deg,
-               temp_err_c, vis_err_m, ceiling_err_ft, weighted_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT DO NOTHING
-            """,
-            [taf_id, icao, valid_hour, lead_h, s["scoring_profile"], s["fcst_category"],
-             s["obs_category"], s["category_outcome"], s["wind_err_kt"], s["dir_err_deg"],
-             s["temp_err_c"], s["vis_err_m"], s["ceiling_err_ft"], s["weighted_score"]],
-        )
-    return len(rows)
+        rows.append((taf["id"], taf["icao"], eh.valid_hour, lead_h, s["scoring_profile"],
+                     s["fcst_category"], s["obs_category"], s["category_outcome"],
+                     s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"], s["vis_err_m"],
+                     s["ceiling_err_ft"], s["weighted_score"]))
+    return rows
 
 
 def verify_pending(con: duckdb.DuckDBPyConnection, icaos: list[str] | None = None) -> int:
-    """Verify all TAFs that have no verification rows yet. Returns rows written."""
+    """Verify all TAFs that have no verification rows yet (vectorized bulk insert)."""
+    from wx.db import repositories as repo
+
     where = ""
     params: list = []
     if icaos:
@@ -93,8 +80,8 @@ def verify_pending(con: duckdb.DuckDBPyConnection, icaos: list[str] | None = Non
         params,
     ).fetchall()
 
-    total = 0
+    rows = []
     for row in tafs:
         taf = dict(zip(("id", "icao", "issued_at", "valid_from", "valid_to"), row))
-        total += verify_taf(con, taf)
-    return total
+        rows.extend(score_taf_rows(con, taf))
+    return repo.store_verification(con, rows)

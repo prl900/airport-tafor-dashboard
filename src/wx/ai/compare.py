@@ -29,7 +29,9 @@ def run_candidate(con: duckdb.DuckDBPyConnection, forecaster: Forecaster,
         params,
     ).fetchall()
 
-    total = 0
+    from wx.db import repositories as repo
+
+    rows = []
     for taf_id, icao, issued_at, valid_from, valid_to in tafs:
         expected = forecaster.generate(con, icao, issued_at, valid_from, valid_to)
         if not expected:
@@ -40,21 +42,11 @@ def run_candidate(con: duckdb.DuckDBPyConnection, forecaster: Forecaster,
             if s is None:
                 continue
             lead_h = int((eh.valid_hour - issued_at).total_seconds() // 3600)
-            con.execute(
-                """
-                INSERT INTO verification_hourly
-                  (taf_forecast_id, icao, valid_hour, lead_time_h, scoring_profile,
-                   fcst_category, obs_category, category_outcome, wind_err_kt, dir_err_deg,
-                   temp_err_c, vis_err_m, ceiling_err_ft, weighted_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT DO NOTHING
-                """,
-                [taf_id, icao, eh.valid_hour, lead_h, forecaster.name, s["fcst_category"],
-                 s["obs_category"], s["category_outcome"], s["wind_err_kt"], s["dir_err_deg"],
-                 s["temp_err_c"], s["vis_err_m"], s["ceiling_err_ft"], s["weighted_score"]],
-            )
-            total += 1
-    return total
+            rows.append((taf_id, icao, eh.valid_hour, lead_h, forecaster.name,
+                         s["fcst_category"], s["obs_category"], s["category_outcome"],
+                         s["wind_err_kt"], s["dir_err_deg"], s["temp_err_c"],
+                         s["vis_err_m"], s["ceiling_err_ft"], s["weighted_score"]))
+    return repo.store_verification(con, rows)
 
 
 def run_all_candidates(con: duckdb.DuckDBPyConnection, icaos: list[str] | None = None) -> dict:
