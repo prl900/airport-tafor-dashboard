@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data (large / derived — keep out of git)
+data/raw_cache/
+data/era5/
+*.duckdb
+*.duckdb.wal
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# Env / secrets
+.env
+.cdsapirc
