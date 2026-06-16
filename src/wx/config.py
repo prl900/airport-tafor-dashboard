@@ -24,9 +24,10 @@ class Settings(BaseSettings):
     # Ingestion politeness
     iem_base_url: str = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     iem_min_interval_s: float = 1.0  # IEM asks for <= 1 request/second
-    ogimet_base_url: str = "https://www.ogimet.com/display_metars2.php"
-    ogimet_min_interval_s: float = 5.0  # Ogimet is fragile — be gentle
-    http_timeout_s: float = 60.0
+    # Ogimet bulk tools (getmetar/gettafor) allow 1 request/minute/IP. Use 62s
+    # for safety; cache by (prefix, year) so this is paid at most once per granule.
+    ogimet_min_interval_s: float = 62.0
+    http_timeout_s: float = 120.0
 
     # AEMET OpenData (authoritative spot-check) — set WX_AEMET_API_KEY to enable
     aemet_api_key: str | None = None

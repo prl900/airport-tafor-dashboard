@@ -19,6 +19,8 @@ def connect(db_path: Path | None = None, read_only: bool = False) -> duckdb.Duck
     con = duckdb.connect(path, read_only=read_only)
     # spatial is needed for the stations.geom helpers / map queries.
     con.execute("INSTALL spatial; LOAD spatial;")
+    # Render TIMESTAMPTZ in UTC so readback matches what we stored.
+    con.execute("SET TimeZone='UTC';")
     return con
 
 

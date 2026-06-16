@@ -17,6 +17,7 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     "python-dateutil>=2.9",
+    "pytz>=2024.2",
 ]
 
 [project.optional-dependencies]
