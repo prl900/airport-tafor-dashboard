@@ -43,8 +43,11 @@ def _estimators(rung: str):
         return (lambda: LinearRegression(),
                 lambda: LogisticRegression(max_iter=1000))
     if rung == "rf":
-        return (lambda: RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=0),
-                lambda: RandomForestClassifier(n_estimators=200, n_jobs=-1,
+        # depth-capped + fewer trees: 7 multi-target forests on ~800k rows are slow
+        # and memory-heavy at full depth (the earlier full run was killed here).
+        return (lambda: RandomForestRegressor(n_estimators=100, max_depth=20,
+                                              n_jobs=-1, random_state=0),
+                lambda: RandomForestClassifier(n_estimators=100, max_depth=20, n_jobs=-1,
                                                class_weight="balanced", random_state=0))
     if rung == "gbm":
         return (lambda: HistGradientBoostingRegressor(random_state=0),

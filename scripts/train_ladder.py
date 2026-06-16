@@ -7,7 +7,8 @@ from wx.ai.train import official_bss, train_and_evaluate
 from wx.db.connection import connect
 
 SAMPLE_PCT = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-RUNGS = ["linreg", "rf", "gbm", "mlp"]
+# rungs after the sample_pct arg, else the full ladder (fast rungs first; RF last)
+RUNGS = sys.argv[2:] or ["linreg", "gbm", "mlp", "rf"]
 
 con = connect(read_only=True)
 off = official_bss(con)
