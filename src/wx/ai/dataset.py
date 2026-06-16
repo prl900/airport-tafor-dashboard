@@ -30,14 +30,22 @@ def _era5_cols(alias: str, prefix: str) -> str:
     return ", ".join(f"{alias}.{c} AS {prefix}_{c}" for c in _ERA5_FIELDS)
 
 
-def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None) -> pd.DataFrame:
-    """Build the causal sample frame from the DB (metar_obs targets + nwp_point)."""
+def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
+                  sample_pct: int | None = None) -> pd.DataFrame:
+    """Build the causal sample frame from the DB (metar_obs targets + nwp_point).
+
+    ``sample_pct`` (1-100) keeps a reproducible hash-based subset of target obs —
+    the dense (obs x lead) grid is ~22M rows at full size, so training samples a
+    tractable fraction. The hash on observed_at is deterministic across runs."""
     leads_vals = ", ".join(f"({int(h)})" for h in leads)
     icao_filter = ""
     params: list = [start, start, end, end]
     if icaos:
         icao_filter = f"AND icao IN ({','.join(['?'] * len(icaos))})"
         params += list(icaos)
+    sample_filter = ""
+    if sample_pct is not None and sample_pct < 100:
+        sample_filter = f"AND (hash(observed_at) % 100) < {int(sample_pct)}"
 
     sql = f"""
     WITH leads(h) AS (VALUES {leads_vals}),
@@ -48,7 +56,7 @@ def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None) ->
         FROM metar_obs
         WHERE (CAST(? AS TIMESTAMPTZ) IS NULL OR observed_at >= ?)
           AND (CAST(? AS TIMESTAMPTZ) IS NULL OR observed_at < ?)
-          {icao_filter}
+          {icao_filter} {sample_filter}
     ),
     grid AS (
         SELECT t.*, l.h AS lead_h,

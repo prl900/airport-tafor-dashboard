@@ -90,13 +90,19 @@ class MultiTaskModel:
         self.numeric_cols = feature_columns(df)
         self.pre = _make_preprocessor(self.numeric_cols)
         X = self.pre.fit_transform(df[self.numeric_cols + CAT_FEATURES])
+        # Targets can be missing (e.g. METARs with no reported vis/wind/category) —
+        # fit each head on the rows where its own target is present.
         for t in REG_TARGETS:
+            y = df[t].astype(float)
+            mask = y.notna().to_numpy()
             m = reg_factory()
-            m.fit(X, df[t].astype(float))
+            m.fit(X[mask], y[mask])
             self.reg[t] = m
         for t in CLF_TARGETS:
+            y = df[t]
+            mask = y.notna().to_numpy()
             m = clf_factory()
-            m.fit(X, df[t])
+            m.fit(X[mask], y[mask])
             self.clf[t] = m
         return self
 
@@ -108,6 +114,19 @@ class MultiTaskModel:
         for t, m in self.clf.items():
             out[t.replace("y_", "pred_")] = m.predict(X)
         return out
+
+    def predict_adverse_proba(self, df: pd.DataFrame):
+        """P(IFR-or-worse) from the category classifier's class probabilities —
+        the model's probabilistic forecast for the Brier/BSS benchmark."""
+        import numpy as np
+
+        X = self.pre.transform(df[self.numeric_cols + CAT_FEATURES])
+        clf = self.clf["y_cat"]
+        proba = clf.predict_proba(X)
+        adverse_idx = [i for i, c in enumerate(clf.classes_) if c in ("IFR", "LIFR")]
+        if not adverse_idx:
+            return np.zeros(len(df))
+        return proba[:, adverse_idx].sum(axis=1)
 
     def save(self, path):
         import joblib

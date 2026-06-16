@@ -195,31 +195,32 @@ def compare(
 def train(
     rung: str = typer.Option("gbm", help="linreg | rf | gbm | mlp"),
     station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+    sample_pct: int = typer.Option(5, help="%% of target obs to sample (dense grid is ~22M)"),
     train_end: str = typer.Option("2024-01-01", help="train < this <= val"),
     val_end: str = typer.Option("2025-01-01", help="val < this <= frozen test"),
 ) -> None:
-    """Train a model-ladder rung and evaluate it vs the official-TAF skyline."""
+    """Train a model-ladder rung; evaluate on the frozen test split vs the references."""
     from wx.ai.train import train_and_evaluate
 
     with get_connection(read_only=True) as con:
-        _, rec = train_and_evaluate(con, rung, icaos=station or None,
-                                    train_end=train_end, val_end=val_end)
-    m, o = rec["model"], rec["official"]
-    table = Table(title=f"{rung}: validation vs official (n_tafs={m['n_tafs']})")
-    for c in ("Forecaster", "HSS", "POD", "FAR", "vis MAE"):
-        table.add_column(c, justify="right")
-    for name, r in (("model:" + rung, m), ("official", o),
-                    ("persistence", rec["persistence"]), ("climatology", rec["climatology"])):
-        s = r["skill"]
-        table.add_row(name,
-                      f"{s['HSS']:.3f}" if s["HSS"] is not None else "—",
-                      f"{s['POD']:.2f}" if s["POD"] is not None else "—",
-                      f"{s['FAR']:.2f}" if s["FAR"] is not None else "—",
-                      f"{r['mae']['vis']:.0f}" if r['mae']['vis'] else "—")
-    console.print(table)
-    v = rec["vs_official"]
-    verdict = "[green]BEATS official[/]" if v["wins"] else "does not beat official"
-    console.print(f"HSS diff vs official: {v['diff']} CI[{v['ci_low']},{v['ci_high']}] → {verdict}")
+        rec = train_and_evaluate(con, rung, icaos=station or None, sample_pct=sample_pct,
+                                 train_end=train_end, val_end=val_end)
+    t, ref = rec["test"], rec["reference"]
+    s = t["skill"]
+    console.print(f"[bold]{rung}[/] trained on {rec['n_train']:,} rows, tested on {t['n']:,} "
+                  f"(sample {sample_pct}%)")
+    fnum = lambda v, d=3: f"{v:.{d}f}" if v is not None else "—"
+    console.print(f"  HSS={fnum(s['HSS'])}  POD={fnum(s['POD'],2)}  FAR={fnum(s['FAR'],2)}  "
+                  f"Brier={fnum(t['brier'])}  [bold]BSS={fnum(t['bss'])}[/]")
+    console.print(f"  vis MAE={fnum(t['mae']['vis'],0)}m  ceil MAE={fnum(t['mae']['ceiling'],0)}ft  "
+                  f"wind MAE={fnum(t['mae']['wind'],1)}kt")
+    off = ref["official_bss"]
+    console.print(f"  references — climatology BSS=0.000  official TAF BSS={fnum(off)}")
+    if t["bss"] is not None and t["bss"] > 0:
+        console.print("  [green]→ positive BSS: beats climatology[/]"
+                      + (" and the official TAF" if off is not None and t["bss"] > off else ""))
+    else:
+        console.print("  → does not yet beat climatology (BSS<=0)")
 
 
 @app.command()
