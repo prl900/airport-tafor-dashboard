@@ -74,6 +74,33 @@ class ClimatologyForecaster(Forecaster):
         return out
 
 
+class OfficialForecaster(Forecaster):
+    """The official TAF, presented as a Forecaster by expanding its stored change
+    groups — so the human forecast is the 'skyline' the models are measured against
+    through the exact same evaluation path."""
+
+    name = "official"
+
+    def generate(self, con, icao, issued_at, valid_from, valid_to) -> list[ExpectedHour]:
+        from wx.verification.runner import _GROUP_COLS
+        from wx.verification.timeline import expand
+
+        row = con.execute(
+            "SELECT id FROM taf_forecast WHERE icao = ? AND issued_at = ?",
+            [icao, issued_at],
+        ).fetchone()
+        if row is None:
+            return []
+        groups = [
+            dict(zip(_GROUP_COLS, r))
+            for r in con.execute(
+                f"SELECT {', '.join(_GROUP_COLS)} FROM taf_group WHERE taf_forecast_id = ?",
+                [row[0]],
+            ).fetchall()
+        ]
+        return expand(groups, valid_from, valid_to)
+
+
 FORECASTERS: dict[str, Forecaster] = {
     f.name: f for f in (PersistenceForecaster(), ClimatologyForecaster())
 }
