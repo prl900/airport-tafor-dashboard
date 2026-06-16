@@ -5,11 +5,10 @@ so re-running never duplicates and improving the parser re-parses cleanly."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 import duckdb
 
-from wx.parsing.metar import ParsedMetar, parse_metar
+from wx.parsing.metar import parse_metar
 from wx.parsing.taf import ParsedTaf, parse_taf
 
 # --- raw storage -----------------------------------------------------------
@@ -54,8 +53,22 @@ def store_raw_taf(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
 # --- parse stage -----------------------------------------------------------
 
 
+_METAR_INSERT = """
+    INSERT INTO metar_obs
+      (raw_metar_id, icao, observed_at, wind_dir_deg, wind_spd_kt, wind_gust_kt,
+       vis_m, temp_c, dewpoint_c, qnh_hpa, ceiling_ft, flight_category, clouds, weather)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT DO NOTHING
+"""
+_BATCH = 100_000
+
+
 def parse_pending_metar(con: duckdb.DuckDBPyConnection) -> int:
-    """Parse raw_metar rows lacking a metar_obs child. Returns rows parsed."""
+    """Parse raw_metar rows lacking a metar_obs child (batched). Returns rows parsed.
+
+    Inserts are batched via executemany — millions of single-row autocommit inserts
+    would otherwise dominate the full backfill.
+    """
     pending = con.execute(
         """
         SELECT r.id, r.observed_at, r.raw_text
@@ -65,33 +78,27 @@ def parse_pending_metar(con: duckdb.DuckDBPyConnection) -> int:
         """
     ).fetchall()
 
+    rows: list[tuple] = []
     n = 0
     for raw_id, observed_at, raw_text in pending:
         try:
             p = parse_metar(raw_text, observed_at)
         except Exception:
             continue  # leave unparsed; a parser improvement can retry later
-        _insert_metar_obs(con, raw_id, p)
-        n += 1
-    return n
-
-
-def _insert_metar_obs(con: duckdb.DuckDBPyConnection, raw_id: int, p: ParsedMetar) -> None:
-    c = p.conditions
-    con.execute(
-        """
-        INSERT INTO metar_obs
-          (raw_metar_id, icao, observed_at, wind_dir_deg, wind_spd_kt, wind_gust_kt,
-           vis_m, temp_c, dewpoint_c, qnh_hpa, ceiling_ft, flight_category, clouds, weather)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO NOTHING
-        """,
-        [
+        c = p.conditions
+        rows.append((
             raw_id, p.icao, p.observed_at, c.wind_dir_deg, c.wind_spd_kt, c.wind_gust_kt,
             c.vis_m, p.temp_c, p.dewpoint_c, p.qnh_hpa, c.ceiling_ft, c.flight_category,
             json.dumps(c.clouds), json.dumps(c.weather),
-        ],
-    )
+        ))
+        if len(rows) >= _BATCH:
+            con.executemany(_METAR_INSERT, rows)
+            n += len(rows)
+            rows = []
+    if rows:
+        con.executemany(_METAR_INSERT, rows)
+        n += len(rows)
+    return n
 
 
 def store_nwp_points(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
@@ -118,7 +125,12 @@ def store_nwp_points(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int
 
 
 def parse_pending_taf(con: duckdb.DuckDBPyConnection) -> int:
-    """Parse raw_taf rows lacking a taf_forecast child. Returns rows parsed."""
+    """Parse raw_taf rows lacking a taf_forecast child (batched). Returns TAFs parsed.
+
+    Forecasts are inserted in one executemany, then their ids are mapped back by
+    raw_taf_id to insert all change groups in a second executemany — avoiding a
+    per-TAF insert+select+N-inserts round trip over hundreds of thousands of TAFs.
+    """
     pending = con.execute(
         """
         SELECT r.id, r.issued_at, r.raw_text
@@ -128,33 +140,40 @@ def parse_pending_taf(con: duckdb.DuckDBPyConnection) -> int:
         """
     ).fetchall()
 
-    n = 0
+    parsed: list[tuple[int, ParsedTaf]] = []
     for raw_id, issued_at, raw_text in pending:
         try:
-            p = parse_taf(raw_text, issued_at)
+            parsed.append((raw_id, parse_taf(raw_text, issued_at)))
         except Exception:
             continue
-        _insert_taf(con, raw_id, p)
-        n += 1
-    return n
+    if not parsed:
+        return 0
 
-
-def _insert_taf(con: duckdb.DuckDBPyConnection, raw_id: int, p: ParsedTaf) -> None:
-    con.execute(
+    con.executemany(
         """
         INSERT INTO taf_forecast (raw_taf_id, icao, issued_at, valid_from, valid_to)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT DO NOTHING
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
         """,
-        [raw_id, p.icao, p.issued_at, p.valid_from, p.valid_to],
+        [(rid, p.icao, p.issued_at, p.valid_from, p.valid_to) for rid, p in parsed],
     )
-    row = con.execute("SELECT id FROM taf_forecast WHERE raw_taf_id = ?", [raw_id]).fetchone()
-    if row is None:
-        return
-    fid = row[0]
-    for g in p.groups:
-        c = g.conditions
-        con.execute(
+
+    # Map raw_taf_id -> taf_forecast.id for the rows we just inserted.
+    idmap = dict(con.execute("SELECT raw_taf_id, id FROM taf_forecast").fetchall())
+
+    group_rows = []
+    for rid, p in parsed:
+        fid = idmap.get(rid)
+        if fid is None:
+            continue
+        for g in p.groups:
+            c = g.conditions
+            group_rows.append((
+                fid, g.group_type, g.probability, g.valid_from, g.valid_to,
+                c.wind_dir_deg, c.wind_spd_kt, c.wind_gust_kt, c.vis_m, c.ceiling_ft,
+                c.flight_category, json.dumps(c.clouds), json.dumps(c.weather),
+            ))
+    if group_rows:
+        con.executemany(
             """
             INSERT INTO taf_group
               (taf_forecast_id, group_type, probability, valid_from, valid_to,
@@ -162,9 +181,6 @@ def _insert_taf(con: duckdb.DuckDBPyConnection, raw_id: int, p: ParsedTaf) -> No
                flight_category, clouds, weather)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                fid, g.group_type, g.probability, g.valid_from, g.valid_to,
-                c.wind_dir_deg, c.wind_spd_kt, c.wind_gust_kt, c.vis_m, c.ceiling_ft,
-                c.flight_category, json.dumps(c.clouds), json.dumps(c.weather),
-            ],
+            group_rows,
         )
+    return len(parsed)
