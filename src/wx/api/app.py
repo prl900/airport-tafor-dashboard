@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from wx.api.routes import metar, stations, taf, verification
+from wx.api.routes import metar, nwp, stations, taf, verification
 
 
 def create_app() -> FastAPI:
@@ -23,6 +23,7 @@ def create_app() -> FastAPI:
     app.include_router(stations.router)
     app.include_router(metar.router)
     app.include_router(taf.router)
+    app.include_router(nwp.router)
     app.include_router(verification.router)
 
     @app.get("/health", tags=["meta"])

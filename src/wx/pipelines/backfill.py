@@ -111,6 +111,38 @@ def verify(
 
 
 @app.command()
+def nwp(
+    start: str = typer.Option(..., help="ISO date, inclusive"),
+    end: str = typer.Option(..., help="ISO date, exclusive"),
+) -> None:
+    """Download ERA5 (Copernicus CDS) per year and extract per-station point series.
+
+    Requires cdsapi credentials in ~/.cdsapirc. Gridded NetCDF is cached in
+    data/era5; nwp_point holds the nearest-gridpoint series per airport.
+    """
+    import xarray as xr
+
+    from wx.ingestion.nwp_era5 import download_year, extract_points
+
+    t0, t1 = _utc(start), _utc(end)
+    with get_connection() as con:
+        stations = [
+            dict(zip(("icao", "lat", "lon"), row))
+            for row in con.execute("SELECT icao, lat, lon FROM stations").fetchall()
+        ]
+        total = 0
+        for year in range(t0.year, t1.year + 1):
+            console.print(f"  ERA5 {year}: downloading (CDS queue may take minutes)…")
+            path = download_year(year)
+            with xr.open_dataset(path) as ds:
+                recs = extract_points(ds, stations)
+            recs = [r for r in recs if t0 <= r["valid_time"] < t1]
+            total += repo.store_nwp_points(con, recs)
+            console.print(f"  ERA5 {year}: {len(recs)} point-rows")
+    console.print(f"[green]Stored[/] {total} nwp_point rows.")
+
+
+@app.command()
 def status() -> None:
     """Show row counts across the pipeline tables."""
     with get_connection(read_only=True) as con:

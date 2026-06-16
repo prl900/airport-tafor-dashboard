@@ -94,6 +94,29 @@ def _insert_metar_obs(con: duckdb.DuckDBPyConnection, raw_id: int, p: ParsedMeta
     )
 
 
+def store_nwp_points(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
+    """Upsert ERA5 per-station point series into nwp_point. Returns rows written."""
+    if not records:
+        return 0
+    before = con.execute("SELECT count(*) FROM nwp_point").fetchone()[0]
+    con.executemany(
+        """
+        INSERT INTO nwp_point
+          (icao, valid_time, source, wind10m_spd, wind10m_dir, gust, t2m_c, d2m_c,
+           tcc, lcc, mcc, hcc, cbh_m, tp_mm, mslp_hpa)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
+        """,
+        [
+            (r["icao"], r["valid_time"], r["source"], r["wind10m_spd"], r["wind10m_dir"],
+             r["gust"], r["t2m_c"], r["d2m_c"], r["tcc"], r["lcc"], r["mcc"], r["hcc"],
+             r["cbh_m"], r["tp_mm"], r["mslp_hpa"])
+            for r in records
+        ],
+    )
+    return con.execute("SELECT count(*) FROM nwp_point").fetchone()[0] - before
+
+
 def parse_pending_taf(con: duckdb.DuckDBPyConnection) -> int:
     """Parse raw_taf rows lacking a taf_forecast child. Returns rows parsed."""
     pending = con.execute(
