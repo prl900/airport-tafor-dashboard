@@ -95,10 +95,12 @@ def bootstrap_hss_diff(champion: list[str], challenger: list[str],
     CI excludes zero on the positive side.
     """
     m = min(len(champion), len(challenger))
-    if m == 0:
+    champ_hss = skill_scores(champion)["HSS"]
+    chal_hss = skill_scores(challenger)["HSS"]
+    if m == 0 or champ_hss is None or chal_hss is None:
         return {"diff": None, "ci_low": None, "ci_high": None, "wins": False}
     rng = random.Random(seed)
-    base = skill_scores(challenger)["HSS"] - skill_scores(champion)["HSS"]
+    base = chal_hss - champ_hss
     diffs = []
     idx = range(m)
     for _ in range(n_boot):
@@ -107,6 +109,8 @@ def bootstrap_hss_diff(champion: list[str], challenger: list[str],
         b = skill_scores([challenger[i] for i in sample])["HSS"]
         if a is not None and b is not None:
             diffs.append(b - a)
+    if not diffs:
+        return {"diff": base, "ci_low": None, "ci_high": None, "wins": False}
     diffs.sort()
     lo = diffs[int(0.025 * len(diffs))]
     hi = diffs[int(0.975 * len(diffs))]

@@ -26,6 +26,10 @@ nwp = [
     "xarray>=2024.10",
     "netCDF4>=1.7",
 ]
+ml = [
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
+]
 dev = [
     "pytest>=8.3",
     "ruff>=0.9",

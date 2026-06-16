@@ -191,6 +191,37 @@ def compare(
 
 
 @app.command()
+def train(
+    rung: str = typer.Option("gbm", help="linreg | rf | gbm | mlp"),
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+    train_end: str = typer.Option("2024-01-01", help="train < this <= val"),
+    val_end: str = typer.Option("2025-01-01", help="val < this <= frozen test"),
+) -> None:
+    """Train a model-ladder rung and evaluate it vs the official-TAF skyline."""
+    from wx.ai.train import train_and_evaluate
+
+    with get_connection(read_only=True) as con:
+        _, rec = train_and_evaluate(con, rung, icaos=station or None,
+                                    train_end=train_end, val_end=val_end)
+    m, o = rec["model"], rec["official"]
+    table = Table(title=f"{rung}: validation vs official (n_tafs={m['n_tafs']})")
+    for c in ("Forecaster", "HSS", "POD", "FAR", "vis MAE"):
+        table.add_column(c, justify="right")
+    for name, r in (("model:" + rung, m), ("official", o),
+                    ("persistence", rec["persistence"]), ("climatology", rec["climatology"])):
+        s = r["skill"]
+        table.add_row(name,
+                      f"{s['HSS']:.3f}" if s["HSS"] is not None else "—",
+                      f"{s['POD']:.2f}" if s["POD"] is not None else "—",
+                      f"{s['FAR']:.2f}" if s["FAR"] is not None else "—",
+                      f"{r['mae']['vis']:.0f}" if r['mae']['vis'] else "—")
+    console.print(table)
+    v = rec["vs_official"]
+    verdict = "[green]BEATS official[/]" if v["wins"] else "does not beat official"
+    console.print(f"HSS diff vs official: {v['diff']} CI[{v['ci_low']},{v['ci_high']}] → {verdict}")
+
+
+@app.command()
 def status() -> None:
     """Show row counts across the pipeline tables."""
     with get_connection(read_only=True) as con:
