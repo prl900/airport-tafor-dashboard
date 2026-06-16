@@ -83,6 +83,15 @@ header.topbar input[type="date"] {
 
 .loading { color: var(--muted); padding: 12px 4px; }
 
+.metrics { display: flex; gap: 10px; flex-wrap: wrap; }
+.metric {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 14px; min-width: 78px; text-align: center;
+}
+.metric-val { font-size: 19px; font-weight: 650; color: var(--text); }
+.metric-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; letter-spacing: .3px; }
+.empty code, .metric code { font-family: ui-monospace, monospace; color: var(--accent); }
+
 /* MapLibre marker */
 .apt-marker {
   width: 13px; height: 13px; border-radius: 50%;

@@ -99,6 +99,18 @@ def backfill(
 
 
 @app.command()
+def verify(
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+) -> None:
+    """Score stored TAFs against METAR observations (writes verification_hourly)."""
+    from wx.verification.runner import verify_pending
+
+    with get_connection() as con:
+        n = verify_pending(con, station or None)
+    console.print(f"[green]Verified[/] {n} TAF-hours.")
+
+
+@app.command()
 def status() -> None:
     """Show row counts across the pipeline tables."""
     with get_connection(read_only=True) as con:

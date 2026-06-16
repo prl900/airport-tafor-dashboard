@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "./api";
 import SpainMap from "./SpainMap";
 import StationCharts from "./StationCharts";
+import Scorecard from "./Scorecard";
 
 export default function App() {
   const [stations, setStations] = useState([]);
@@ -74,6 +75,7 @@ export default function App() {
               {station.region} · {station.lat.toFixed(3)}, {station.lon.toFixed(3)} ·{" "}
               {data.metar.length} obs · {data.taf.length} TAFs in range
             </div>
+            <Scorecard icao={selected} />
             {loading ? (
               <div className="loading">Loading…</div>
             ) : (
