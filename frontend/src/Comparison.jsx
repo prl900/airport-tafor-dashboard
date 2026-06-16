@@ -25,7 +25,8 @@ export default function Comparison({ icao }) {
       </div>
     );
 
-  const best = [...rows].sort((a, b) => (b.HSS || 0) - (a.HSS || 0))[0];
+  // Rank by Brier Skill Score — the probabilistic metric that credits hedging.
+  const best = [...rows].sort((a, b) => (b.bss ?? -1) - (a.bss ?? -1))[0];
 
   return (
     <div className="chart-card">
@@ -33,8 +34,8 @@ export default function Comparison({ icao }) {
       <table className="cmp">
         <thead>
           <tr>
-            <th>Forecaster</th><th>Mean skill</th><th>POD</th><th>FAR</th>
-            <th>HSS</th><th>n</th>
+            <th>Forecaster</th><th>Brier↓</th><th>BSS↑</th>
+            <th>HSS</th><th>POD</th><th>FAR</th><th>n</th>
           </tr>
         </thead>
         <tbody>
@@ -42,21 +43,26 @@ export default function Comparison({ icao }) {
             <tr key={r.profile} className={r.profile === "official" ? "official" : ""}>
               <td>
                 {r.profile}
-                {r.profile === best.profile && r.HSS > 0 && <span className="badge">best skill</span>}
+                {r.profile === best.profile && (r.bss ?? -1) > 0 && (
+                  <span className="badge">best skill</span>
+                )}
               </td>
-              <td>{fmt(r.mean_weighted_score, 3)}</td>
+              <td>{fmt(r.brier, 3)}</td>
+              <td>{fmt(r.bss)}</td>
+              <td>{fmt(r.HSS)}</td>
               <td>{pct(r.POD)}</td>
               <td>{pct(r.FAR)}</td>
-              <td>{fmt(r.HSS)}</td>
               <td>{r.n?.toLocaleString?.() ?? r.n}</td>
             </tr>
           ))}
         </tbody>
       </table>
       <p className="cmp-note">
-        Mean skill can mislead: a climatology that always predicts the common (VFR) case
-        scores high yet has POD≈0 — it never warns of IFR/LIFR. HSS rewards detecting the
-        adverse event, which is what matters operationally.
+        <b>Brier</b> scores the forecast <i>probability</i> of IFR-or-worse (lower is better);
+        <b> BSS</b> is its skill vs climatology (&gt;0 = better). Unlike HSS's strict
+        contingency — which counts every <code>PROB30/TEMPO</code> hedge as a false alarm — Brier
+        credits a 30%-fog forecast that verifies ~30% of the time, so it's the fair way to ask
+        whether a model beats the official TAF.
       </p>
     </div>
   );
