@@ -25,14 +25,28 @@ uv run wx initdb             # creates wx.duckdb, applies schema, seeds stations
 uv run wx stations           # list seeded Spanish airports
 ```
 
-## Backfill historical data (Phase 1)
+## Pipeline commands
 ```bash
-# One station, one month (smoke test)
-uv run wx backfill --station LEMD --start 2023-01-01 --end 2023-02-01
+# Backfill METAR (IEM) + TAF (Ogimet) -> store raw -> parse to components
+uv run wx backfill --station LEMD --start 2023-01-01 --end 2023-02-01   # smoke test
+uv run wx backfill --start 2020-01-01 --end 2026-01-01                  # full seed/window
+uv run wx backfill --metar-source ogimet ...                           # METAR from Ogimet too
 
-# Full seed set, full window
-uv run wx backfill --start 2020-01-01 --end 2025-12-31
+# Score TAFs against observations (POD/FAR/CSI/HSS, element errors)
+uv run wx verify
+
+# Download ERA5 NWP (needs ~/.cdsapirc) and extract per-station series
+uv run wx nwp --start 2023-01-01 --end 2023-02-01
+
+# Generate baseline candidate TAFs and compare skill vs the official TAFs
+uv run wx compare
+
+uv run wx status     # row counts across the pipeline
 ```
+
+Ogimet uses the bulk `getmetar`/`gettafor` tools (1 request/minute/IP, fetched per
+region-prefix per year and cached — so a full 24-station backfill makes only a
+handful of live requests). A full-year granule lives on slow storage (~2-3 min).
 
 ## Run the API
 ```bash
