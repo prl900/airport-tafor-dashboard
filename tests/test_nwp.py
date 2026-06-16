@@ -58,3 +58,29 @@ def test_extract_points_handles_valid_time_coord():
     ds = _synthetic_dataset().rename({"time": "valid_time"})
     recs = extract_points(ds, [{"icao": "LEMD", "lat": 40.5, "lon": -3.5}])
     assert recs[0]["valid_time"].year == 2023
+
+
+def test_extract_timeseries_single_point_subset():
+    """Timeseries dataset: a single point (scalar lat/lon, valid_time dim) and a
+    variable subset (no lcc/mcc/hcc) — extract_timeseries handles both."""
+    from wx.ingestion.nwp_era5 import extract_timeseries
+
+    times = np.array(["2023-01-01T00:00:00", "2023-01-01T01:00:00"], dtype="datetime64[ns]")
+    ds = xr.Dataset(
+        {
+            "u10": (("valid_time",), np.array([0.0, 0.0])),
+            "v10": (("valid_time",), np.array([-5.0, -5.0])),
+            "fg10": (("valid_time",), np.array([8.0, 9.0])),
+            "t2m": (("valid_time",), np.array([283.15, 284.15])),
+            "tcc": (("valid_time",), np.array([1.0, 0.5])),
+            "cbh": (("valid_time",), np.array([100.0, 200.0])),
+        },
+        coords={"valid_time": times, "latitude": 40.5, "longitude": -3.5},
+    )
+    recs = extract_timeseries(ds, "LEMD")
+    assert len(recs) == 2
+    assert recs[0]["t2m_c"] == pytest.approx(10.0)
+    assert recs[0]["gust"] == pytest.approx(8.0 * 1.94384)
+    assert recs[0]["wind10m_dir"] in (pytest.approx(0.0), pytest.approx(360.0))
+    assert recs[0]["lcc"] is None  # not in the timeseries subset
+    assert recs[0]["cbh_m"] == 100.0

@@ -26,6 +26,10 @@ import xarray as xr
 from wx.config import ERA5_DIR, settings
 
 DATASET = "reanalysis-era5-single-levels"
+# ARCO/Zarr timeseries dataset: one point, long period, selected variables.
+# It serves a subset of parameters (no low/medium/high cloud split — only tcc);
+# we request the full list and unavailable variables are simply absent.
+TIMESERIES_DATASET = "reanalysis-era5-single-levels-timeseries"
 
 # CDS request variable name -> NetCDF short name we read back.
 ERA5_VARIABLES = {
@@ -77,6 +81,36 @@ def download_year(year: int, out_dir: Path | None = None) -> Path:
     return target
 
 
+def download_station_timeseries(
+    icao: str, lat: float, lon: float, start, end, out_dir: Path | None = None
+) -> Path:
+    """Download the ERA5 point timeseries for one station over [start, end].
+
+    One request returns the whole hourly series for the point — the efficient
+    path for the 2020-2025 per-airport backfill (~one request per station vs
+    downloading gridded full years). Cached per (icao, start, end).
+    """
+    import cdsapi
+
+    out_dir = out_dir or ERA5_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"era5ts_{icao}_{start:%Y%m%d}_{end:%Y%m%d}.nc"
+    if target.exists():
+        return target
+
+    cdsapi.Client().retrieve(
+        TIMESERIES_DATASET,
+        {
+            "variable": list(ERA5_VARIABLES.keys()),
+            "location": {"latitude": lat, "longitude": lon},
+            "date": [f"{start:%Y-%m-%d}/{end:%Y-%m-%d}"],
+            "data_format": "netcdf",
+        },
+        str(target),
+    )
+    return target
+
+
 def load_dataset(path: Path) -> xr.Dataset:
     """Open an ERA5 download as a single Dataset.
 
@@ -103,71 +137,68 @@ def _wind_speed_dir(u, v):
     return spd, direction
 
 
-def extract_points(ds: xr.Dataset, stations: list[dict]) -> list[dict]:
-    """Nearest-gridpoint time series per station, with unit conversions applied.
+def _point_records(pt: xr.Dataset, icao: str) -> list[dict]:
+    """Build nwp_point records from a Dataset already reduced to a single point.
 
-    ``stations`` items need ``icao``, ``lat``, ``lon``. The Dataset must expose
-    ``latitude``/``longitude`` coords and a time coord ('time' or 'valid_time').
+    Shared by the gridded path (after nearest-gridpoint .sel) and the timeseries
+    path (already a point). Applies unit conversions and derives wind speed/dir.
     """
-    time_name = "valid_time" if "valid_time" in ds.coords else "time"
-    times = pd.to_datetime(ds[time_name].values)
+    time_name = "valid_time" if "valid_time" in pt.coords else "time"
+    times = pd.to_datetime(pt[time_name].values)
 
-    def col(short):
-        return ds[short] if short in ds else None
+    def series(short):
+        return pt[short].values if short in pt else None
 
+    def conv(short, fn):
+        vals = series(short)
+        return None if vals is None else fn(vals)
+
+    def get(arr, i):
+        return None if arr is None else _clean(arr[i])
+
+    u, v = series("u10"), series("v10")
+    spd = direction = None
+    if u is not None and v is not None:
+        spd, direction = _wind_speed_dir(u, v)
+    spd_kt = None if spd is None else spd * MS_TO_KT
+
+    gust_short = "fg10" if "fg10" in pt else "i10fg"  # new vs legacy CDS name
+    gust = conv(gust_short, lambda a: a * MS_TO_KT)
+    t2m = conv("t2m", lambda a: a - 273.15)
+    d2m = conv("d2m", lambda a: a - 273.15)
+    tcc, lcc, mcc, hcc = (series(s) for s in ("tcc", "lcc", "mcc", "hcc"))
+    cbh = series("cbh")  # metres
+    tp = conv("tp", lambda a: a * 1000.0)
+    msl = conv("msl", lambda a: a / 100.0)
+
+    records = []
+    for i in range(len(times)):
+        records.append(
+            {
+                "icao": icao,
+                "valid_time": times[i].to_pydatetime().replace(tzinfo=timezone.utc),
+                "source": "era5",
+                "wind10m_spd": get(spd_kt, i), "wind10m_dir": get(direction, i),
+                "gust": get(gust, i), "t2m_c": get(t2m, i), "d2m_c": get(d2m, i),
+                "tcc": get(tcc, i), "lcc": get(lcc, i), "mcc": get(mcc, i), "hcc": get(hcc, i),
+                "cbh_m": get(cbh, i), "tp_mm": get(tp, i), "mslp_hpa": get(msl, i),
+            }
+        )
+    return records
+
+
+def extract_points(ds: xr.Dataset, stations: list[dict]) -> list[dict]:
+    """Gridded path: nearest-gridpoint time series per station (needs lat/lon dims)."""
     records: list[dict] = []
     for st in stations:
         pt = ds.sel(latitude=st["lat"], longitude=st["lon"], method="nearest")
-
-        def series(short):
-            da = col(short)
-            return None if da is None else pt[short].values
-
-        u, v = series("u10"), series("v10")
-        spd = direction = None
-        if u is not None and v is not None:
-            spd, direction = _wind_speed_dir(u, v)
-
-        def conv(short, fn):
-            vals = series(short)
-            return None if vals is None else fn(vals)
-
-        n = len(times)
-
-        def get(arr, i):
-            return None if arr is None else _clean(arr[i])
-
-        gust_short = "fg10" if "fg10" in ds else "i10fg"  # new vs legacy CDS name
-        gust = conv(gust_short, lambda a: a * MS_TO_KT)
-        t2m = conv("t2m", lambda a: a - 273.15)
-        d2m = conv("d2m", lambda a: a - 273.15)
-        tcc, lcc, mcc, hcc = (series(s) for s in ("tcc", "lcc", "mcc", "hcc"))
-        cbh = series("cbh")  # stored as metres (cbh_m)
-        tp = conv("tp", lambda a: a * 1000.0)
-        msl = conv("msl", lambda a: a / 100.0)
-        spd_kt = None if spd is None else spd * MS_TO_KT
-
-        for i in range(n):
-            records.append(
-                {
-                    "icao": st["icao"],
-                    "valid_time": times[i].to_pydatetime().replace(tzinfo=timezone.utc),
-                    "source": "era5",
-                    "wind10m_spd": get(spd_kt, i),
-                    "wind10m_dir": get(direction, i),
-                    "gust": get(gust, i),
-                    "t2m_c": get(t2m, i),
-                    "d2m_c": get(d2m, i),
-                    "tcc": get(tcc, i),
-                    "lcc": get(lcc, i),
-                    "mcc": get(mcc, i),
-                    "hcc": get(hcc, i),
-                    "cbh_m": get(cbh, i),
-                    "tp_mm": get(tp, i),
-                    "mslp_hpa": get(msl, i),
-                }
-            )
+        records.extend(_point_records(pt, st["icao"]))
     return records
+
+
+def extract_timeseries(ds: xr.Dataset, icao: str) -> list[dict]:
+    """Timeseries path: the Dataset is already a single point (scalar lat/lon)."""
+    return _point_records(ds, icao)
 
 
 def _clean(v):

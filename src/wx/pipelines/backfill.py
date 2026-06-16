@@ -114,29 +114,50 @@ def verify(
 def nwp(
     start: str = typer.Option(..., help="ISO date, inclusive"),
     end: str = typer.Option(..., help="ISO date, exclusive"),
+    mode: str = typer.Option("timeseries", help="'timeseries' (per-station, efficient) or 'gridded'"),
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
 ) -> None:
-    """Download ERA5 (Copernicus CDS) per year and extract per-station point series.
+    """Download ERA5 (Copernicus CDS) and extract per-station series into nwp_point.
 
-    Requires cdsapi credentials in ~/.cdsapirc. Gridded NetCDF is cached in
-    data/era5; nwp_point holds the nearest-gridpoint series per airport.
+    Requires cdsapi credentials in ~/.cdsapirc. NetCDF granules are cached in
+    data/era5. 'timeseries' uses the ARCO/Zarr point dataset (one request per
+    station over the whole range — best for backfill); 'gridded' downloads full
+    Iberia years and extracts nearest gridpoints.
     """
-    from wx.ingestion.nwp_era5 import download_year, extract_points, load_dataset
+    from datetime import timedelta
+
+    from wx.ingestion.nwp_era5 import (
+        download_station_timeseries, download_year, extract_points,
+        extract_timeseries, load_dataset,
+    )
 
     t0, t1 = _utc(start), _utc(end)
     with get_connection() as con:
-        stations = [
+        all_st = [
             dict(zip(("icao", "lat", "lon"), row))
             for row in con.execute("SELECT icao, lat, lon FROM stations").fetchall()
         ]
+        stations = [s for s in all_st if not station or s["icao"] in station]
         total = 0
-        for year in range(t0.year, t1.year + 1):
-            console.print(f"  ERA5 {year}: downloading (CDS queue may take minutes)…")
-            path = download_year(year)
-            ds = load_dataset(path)
-            recs = extract_points(ds, stations)
-            recs = [r for r in recs if t0 <= r["valid_time"] < t1]
-            total += repo.store_nwp_points(con, recs)
-            console.print(f"  ERA5 {year}: {len(recs)} point-rows")
+
+        if mode == "timeseries":
+            for st in stations:
+                console.print(f"  ERA5 ts {st['icao']}: downloading (CDS queue)…")
+                path = download_station_timeseries(
+                    st["icao"], st["lat"], st["lon"], t0, t1 - timedelta(days=1)
+                )
+                recs = extract_timeseries(load_dataset(path), st["icao"])
+                recs = [r for r in recs if t0 <= r["valid_time"] < t1]
+                ins = repo.store_nwp_points(con, recs)
+                total += ins
+                console.print(f"  ERA5 ts {st['icao']}: {len(recs)} rows, {ins} new")
+        else:
+            for year in range(t0.year, t1.year + 1):
+                console.print(f"  ERA5 {year}: downloading (CDS queue may take minutes)…")
+                ds = load_dataset(download_year(year))
+                recs = [r for r in extract_points(ds, stations) if t0 <= r["valid_time"] < t1]
+                total += repo.store_nwp_points(con, recs)
+                console.print(f"  ERA5 {year}: {len(recs)} point-rows")
     console.print(f"[green]Stored[/] {total} nwp_point rows.")
 
 

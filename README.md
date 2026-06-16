@@ -35,8 +35,11 @@ uv run wx backfill --metar-source ogimet ...                           # METAR f
 # Score TAFs against observations (POD/FAR/CSI/HSS, element errors)
 uv run wx verify
 
-# Download ERA5 NWP (needs ~/.cdsapirc) and extract per-station series
-uv run wx nwp --start 2023-01-01 --end 2023-02-01
+# Download ERA5 NWP (needs ~/.cdsapirc) and extract per-station series.
+# Default 'timeseries' mode uses the ARCO/Zarr point dataset — one request per
+# station over the whole range (efficient for backfill). 'gridded' pulls Iberia years.
+uv run wx nwp --start 2020-01-01 --end 2026-01-01            # all stations, timeseries
+uv run wx nwp --mode gridded --start 2023-01-01 --end 2023-02-01
 
 # Generate baseline candidate TAFs and compare skill vs the official TAFs
 uv run wx compare
