@@ -103,10 +103,10 @@ def verify(
     station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
 ) -> None:
     """Score stored TAFs against METAR observations (writes verification_hourly)."""
-    from wx.verification.runner import verify_pending
+    from wx.verification.bulk import run_profiles
 
     with get_connection() as con:
-        n = verify_pending(con, station or None)
+        n = run_profiles(con, ["categorical"], station or None)["categorical"]
     console.print(f"[green]Verified[/] {n} TAF-hours.")
 
 
@@ -166,11 +166,12 @@ def compare(
     station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
 ) -> None:
     """Generate baseline candidate TAFs and score them against the official TAFs."""
-    from wx.ai.compare import comparison, run_all_candidates
+    from wx.ai.compare import comparison
+    from wx.verification.bulk import run_profiles
 
     icaos = station or None
     with get_connection() as con:
-        counts = run_all_candidates(con, icaos)
+        counts = run_profiles(con, ["persistence", "climatology"], icaos)
         console.print(f"[cyan]Candidate rows scored:[/] {counts}")
         targets = icaos or [r[0] for r in con.execute(
             "SELECT DISTINCT icao FROM verification_hourly").fetchall()]
