@@ -27,3 +27,8 @@ frontend/dist/
 data/models/gru.joblib
 data/models/tcn.joblib
 data/models/transformer.joblib
+
+# LaTeX build artifacts
+research/*.aux
+research/*.log
+research/*.out
