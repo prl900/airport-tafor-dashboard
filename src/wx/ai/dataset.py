@@ -15,6 +15,8 @@ Returns a pandas DataFrame with engineered features (prefix f_) and targets (y_)
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -22,21 +24,135 @@ LEADS_DEFAULT = (1, 2, 3, 6, 9, 12, 18, 24, 30)
 ANCHOR_MAX_AGE_H = 6        # drop samples whose newest obs <= T0 is staler than this
 NO_CEILING_FT = 30000       # sentinel "unlimited" ceiling for the regression target
 
+# --- memory guard ----------------------------------------------------------
+# Peak resident memory of a build+train scales ~linearly with the number of grid
+# rows (target obs x leads): the DuckDB result and the engineered frame briefly
+# coexist (concat), then a dense transformed matrix + per-target estimators sit
+# on top. Measured on the 5% sample (1.16M rows): build peak ~2.8 GB, full train
+# peak ~3.5 GB across every sklearn rung (linreg/gbm/rf) -> ~3.5 KB/grid-row.
+# A full-data build is ~22.7M rows (~50-70 GB) and OOM-kills a 15 GB box, so we
+# budget a fraction of *available* RAM and fail fast with the max safe sample_pct
+# rather than letting the kernel kill the process. Constant carries model+copy
+# overhead margin; bump it if a heavier estimator or more features are added.
+# Raised 3600->4200 when the METAR-lag features widened the frame (33->54 feats,
+# +36 raw/engineered columns); conservative (errs toward a smaller safe sample).
+PEAK_BYTES_PER_ROW = 4200
+DEFAULT_MEM_FRACTION = 0.6
+
+
+def _available_ram_bytes() -> int | None:
+    """Linux MemAvailable in bytes; falls back to MemTotal, then None (non-Linux)."""
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                info[key] = int(rest.split()[0]) * 1024  # values are in kB
+        return info.get("MemAvailable") or info.get("MemTotal")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _count_grid_rows(con, icaos, leads, start, end, sample_pct) -> int:
+    """Cheap COUNT of grid rows (target obs in window x leads) — no materialization."""
+    where = ["(CAST(? AS TIMESTAMPTZ) IS NULL OR observed_at >= ?)",
+             "(CAST(? AS TIMESTAMPTZ) IS NULL OR observed_at < ?)"]
+    params: list = [start, start, end, end]
+    if icaos:
+        where.append(f"icao IN ({','.join(['?'] * len(icaos))})")
+        params += list(icaos)
+    if sample_pct is not None and sample_pct < 100:
+        where.append(f"(hash(observed_at) % 100) < {int(sample_pct)}")
+    n_obs = con.execute(
+        f"SELECT count(*) FROM metar_obs WHERE {' AND '.join(where)}", params
+    ).fetchone()[0]
+    return n_obs * len(leads)
+
+
+def estimate_build_memory(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
+                          sample_pct=None, mem_fraction=DEFAULT_MEM_FRACTION) -> dict:
+    """Estimate peak RAM for a build at `sample_pct` and the largest safe sample_pct.
+
+    Returns {rows, est_peak_gb, avail_gb, budget_gb, max_safe_pct, over_budget}.
+    `max_safe_pct` is None when available RAM can't be read (non-Linux)."""
+    avail = _available_ram_bytes()
+    rows = _count_grid_rows(con, icaos, leads, start, end, sample_pct)
+    est_peak = rows * PEAK_BYTES_PER_ROW
+    budget = int(avail * mem_fraction) if avail else None
+    max_safe_pct = None
+    if budget:
+        rows_full = _count_grid_rows(con, icaos, leads, start, end, 100)
+        if rows_full:
+            max_safe_pct = max(1, math.floor(budget / PEAK_BYTES_PER_ROW / rows_full * 100))
+    return {
+        "rows": rows,
+        "est_peak_gb": est_peak / 1e9,
+        "avail_gb": (avail or 0) / 1e9,
+        "budget_gb": (budget or 0) / 1e9,
+        "max_safe_pct": max_safe_pct,
+        "over_budget": bool(budget and est_peak > budget),
+    }
+
+
+def check_memory_budget(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
+                        sample_pct=None, mem_fraction=DEFAULT_MEM_FRACTION) -> dict:
+    """Raise MemoryError (naming the max safe sample_pct) if the requested build would
+    likely exceed `mem_fraction` of available RAM. Returns the estimate dict."""
+    est = estimate_build_memory(con, icaos, leads, start, end, sample_pct, mem_fraction)
+    if est["over_budget"]:
+        raise MemoryError(
+            f"build_samples(sample_pct={sample_pct}) would peak ~{est['est_peak_gb']:.1f} GB "
+            f"({est['rows']:,} rows), over the {est['budget_gb']:.1f} GB budget "
+            f"({mem_fraction:.0%} of {est['avail_gb']:.1f} GB available). Use "
+            f"sample_pct<={est['max_safe_pct']} on this machine, free RAM, or raise "
+            f"mem_fraction (pass mem_guard=False to override)."
+        )
+    return est
+
 _ERA5_FIELDS = ("wind10m_spd", "wind10m_dir", "gust", "t2m_c", "d2m_c",
                 "tcc", "cbh_m", "tp_mm", "mslp_hpa")
+
+# Lagged-METAR history: the recent trajectory of the Markov state. All anchored at
+# observed_at <= T0 - lag (strictly causal). Tendencies (current - lag) capture
+# whether conditions are deteriorating -- the strongest signal for fog/adverse onset.
+_LAG_HOURS = (1, 3, 6)
+_OBS_LAG_MAP = {"vis_m": "vis", "ceiling_ft": "ceiling", "wind_spd_kt": "wspd",
+                "temp_c": "temp", "dewpoint_c": "dew"}
 
 
 def _era5_cols(alias: str, prefix: str) -> str:
     return ", ".join(f"{alias}.{c} AS {prefix}_{c}" for c in _ERA5_FIELDS)
 
 
+def _lag_cols(lag: int) -> str:
+    a = f"a{lag}"
+    return ", ".join(f"{a}.{src} AS o{lag}_{dst}" for src, dst in _OBS_LAG_MAP.items())
+
+
+def _lag_joins() -> str:
+    return "\n".join(
+        f"    ASOF LEFT JOIN metar_obs a{lag}\n"
+        f"        ON a{lag}.icao = g.icao AND a{lag}.observed_at <= g.t0 - to_hours({lag})"
+        for lag in _LAG_HOURS
+    )
+
+
 def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
-                  sample_pct: int | None = None) -> pd.DataFrame:
+                  sample_pct: int | None = None, mem_guard: bool = True,
+                  mem_fraction: float = DEFAULT_MEM_FRACTION) -> pd.DataFrame:
     """Build the causal sample frame from the DB (metar_obs targets + nwp_point).
 
     ``sample_pct`` (1-100) keeps a reproducible hash-based subset of target obs —
     the dense (obs x lead) grid is ~22M rows at full size, so training samples a
-    tractable fraction. The hash on observed_at is deterministic across runs."""
+    tractable fraction. The hash on observed_at is deterministic across runs.
+
+    ``mem_guard`` (default on) refuses builds whose estimated peak RAM exceeds
+    ``mem_fraction`` of available memory, raising MemoryError with the largest safe
+    ``sample_pct`` — this is the guard against OOM-killing the machine on a full
+    (or too-large) build. Pass ``mem_guard=False`` to override."""
+    if mem_guard:
+        check_memory_budget(con, icaos=icaos, leads=leads, start=start, end=end,
+                            sample_pct=sample_pct, mem_fraction=mem_fraction)
     leads_vals = ", ".join(f"({int(h)})" for h in leads)
     icao_filter = ""
     params: list = [start, start, end, end]
@@ -78,14 +194,18 @@ _RAW_SELECT = f"""
            a.observed_at AS o0_time, a.vis_m AS o0_vis, a.ceiling_ft AS o0_ceiling,
            a.wind_spd_kt AS o0_wspd, a.wind_dir_deg AS o0_wdir, a.temp_c AS o0_temp,
            a.dewpoint_c AS o0_dew, a.flight_category AS o0_cat,
+           {_lag_cols(1)},
+           {_lag_cols(3)},
+           {_lag_cols(6)},
            {_era5_cols('et', 'et')},
            {_era5_cols('e0', 'e0')},
            s.elevation_m, s.lat, s.lon, s.region
 """
-_JOINS = """
+_JOINS = f"""
     FROM grid g
     ASOF LEFT JOIN metar_obs a
         ON a.icao = g.icao AND a.observed_at <= g.t0
+{_lag_joins()}
     LEFT JOIN nwp_point et
         ON et.icao = g.icao AND et.source = 'era5'
        AND et.valid_time = date_trunc('hour', g.valid_time)
@@ -137,6 +257,21 @@ def engineer(df: pd.DataFrame, with_targets: bool = True) -> pd.DataFrame:
     f["f_o0_spread"] = df["o0_temp"] - df["o0_dew"]      # T-Td: fog proxy
     f["f_o0_temp"] = df["o0_temp"]
     f.update(_circular("f_o0_wdir", df["o0_wdir"]))
+
+    # --- recent-history lags & tendencies (deterioration signal; all tau <= T0) ---
+    o0_ceil = df["o0_ceiling"].fillna(NO_CEILING_FT)
+    o0_spread = df["o0_temp"] - df["o0_dew"]
+    for lag in _LAG_HOURS:
+        lag_ceil = df[f"o{lag}_ceiling"].fillna(NO_CEILING_FT)
+        lag_spread = df[f"o{lag}_temp"] - df[f"o{lag}_dew"]
+        f[f"f_o{lag}_vis"] = df[f"o{lag}_vis"]
+        f[f"f_o{lag}_ceiling"] = lag_ceil
+        f[f"f_o{lag}_spread"] = lag_spread
+        # current - lag: negative vis/ceiling trend = closing in; shrinking T-Td = fog risk
+        f[f"f_dvis_{lag}"] = df["o0_vis"] - df[f"o{lag}_vis"]
+        f[f"f_dceil_{lag}"] = o0_ceil - lag_ceil
+        f[f"f_dspread_{lag}"] = o0_spread - lag_spread
+        f[f"f_dwspd_{lag}"] = df["o0_wspd"] - df[f"o{lag}_wspd"]
 
     # --- ERA5 @t (PP forecast proxy) ---
     f["f_et_wspd"] = df["et_wind10m_spd"]

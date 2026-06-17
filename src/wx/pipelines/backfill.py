@@ -203,8 +203,13 @@ def train(
     from wx.ai.train import train_and_evaluate
 
     with get_connection(read_only=True) as con:
-        rec = train_and_evaluate(con, rung, icaos=station or None, sample_pct=sample_pct,
-                                 train_end=train_end, val_end=val_end)
+        try:
+            rec = train_and_evaluate(con, rung, icaos=station or None, sample_pct=sample_pct,
+                                     train_end=train_end, val_end=val_end)
+        except MemoryError as exc:
+            # The dataset memory guard refused this sample_pct (would OOM this box).
+            console.print(f"[red]aborted:[/] {exc}")
+            raise typer.Exit(code=1) from exc
     t, ref = rec["test"], rec["reference"]
     s = t["skill"]
     console.print(f"[bold]{rung}[/] trained on {rec['n_train']:,} rows, tested on {t['n']:,} "
@@ -221,6 +226,34 @@ def train(
                       + (" and the official TAF" if off is not None and t["bss"] > off else ""))
     else:
         console.print("  → does not yet beat climatology (BSS<=0)")
+
+
+@app.command()
+def promote(
+    rung: str = typer.Option("gbm", help="rung to gate, loaded from data/models/<rung>.joblib"),
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+    register: bool = typer.Option(True, help="record as champion if it wins the gate"),
+) -> None:
+    """Gate a trained model against the champion on the frozen 2025 test; register if it wins.
+
+    Promotion = paired bootstrap CI on the HSS difference excludes zero (ML_PLAN gate).
+    """
+    from wx.ai.promote import promote_if_better
+
+    with get_connection(read_only=True) as con:
+        d = promote_if_better(con, rung, icaos=station or None, register=register)
+    fnum = lambda v, dp=3: f"{v:.{dp}f}" if v is not None else "—"
+    hd = d["hss_diff"]
+    console.print(f"[bold]{d['challenger']}[/] vs champion [bold]{d['champion']}[/] "
+                  f"on {d['n_paired']:,} paired test hours")
+    console.print(f"  HSS  challenger={fnum(d['challenger_hss'])}  champion={fnum(d['champion_hss'])}  "
+                  f"Δ={fnum(hd['diff'])} CI[{fnum(hd['ci_low'])},{fnum(hd['ci_high'])}]")
+    console.print(f"  BSS  challenger={fnum(d['challenger_bss'])}  champion={fnum(d['champion_bss'])}")
+    if d["promote"]:
+        console.print("  [green]→ PROMOTED: HSS gain is significant (CI excludes 0)[/]"
+                      + ("  [registered]" if d.get("registered") else ""))
+    else:
+        console.print("  [yellow]→ not promoted: HSS gain not significant[/]")
 
 
 @app.command()

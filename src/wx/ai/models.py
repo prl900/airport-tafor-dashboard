@@ -50,9 +50,11 @@ def _estimators(rung: str):
                 lambda: RandomForestClassifier(n_estimators=100, max_depth=20, n_jobs=-1,
                                                class_weight="balanced", random_state=0))
     if rung == "gbm":
+        # NO class_weight: balancing inflates P(adverse) to boost recall/HSS but
+        # wrecks calibration (BSS went to -0.46). We instead calibrate probabilities
+        # (isotonic on val) and recover HSS with a val-tuned decision threshold.
         return (lambda: HistGradientBoostingRegressor(random_state=0),
-                lambda: HistGradientBoostingClassifier(
-                    random_state=0, class_weight="balanced"))
+                lambda: HistGradientBoostingClassifier(random_state=0))
     if rung == "mlp":
         return (lambda: MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=300,
                                      early_stopping=True, random_state=0),
@@ -87,8 +89,13 @@ class MultiTaskModel:
         self.pre = None
         self.reg = {}
         self.clf = {}
+        # Calibration (fit on the val split): isotonic remap of raw P(adverse) ->
+        # calibrated probability, plus the decision threshold that maximizes HSS.
+        # Both None/0.5 until calibrated, so an uncalibrated model still works.
+        self.calibrator = None
+        self.adverse_threshold = 0.5
 
-    def fit(self, df: pd.DataFrame) -> "MultiTaskModel":
+    def fit(self, df: pd.DataFrame, val_df: pd.DataFrame | None = None) -> "MultiTaskModel":
         reg_factory, clf_factory = _estimators(self.rung)
         self.numeric_cols = feature_columns(df)
         self.pre = _make_preprocessor(self.numeric_cols)
@@ -107,7 +114,30 @@ class MultiTaskModel:
             m = clf_factory()
             m.fit(X[mask], y[mask])
             self.clf[t] = m
+        if val_df is not None and not val_df.empty:
+            self._calibrate(val_df)
         return self
+
+    def _calibrate(self, val_df: pd.DataFrame) -> None:
+        """Fit isotonic calibration + HSS-optimal threshold on the val split.
+
+        Decouples the two probabilistic jobs: isotonic gives well-calibrated
+        P(adverse) for Brier/BSS, and the tuned threshold restores recall/HSS that
+        a calibrated (unbalanced) classifier's argmax would otherwise lose."""
+        from sklearn.isotonic import IsotonicRegression
+
+        y = val_df["y_cat"]
+        mask = y.notna().to_numpy()
+        if not mask.any():
+            return
+        raw = self._raw_adverse_proba(val_df)[mask]
+        events = y[mask].isin(("IFR", "LIFR")).to_numpy(int)
+        if events.sum() == 0 or events.sum() == len(events):
+            return  # need both classes present to calibrate / tune a threshold
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso.fit(raw, events)
+        self.calibrator = iso
+        self.adverse_threshold = _best_hss_threshold(iso.predict(raw), events)
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
         X = self.pre.transform(df[self.numeric_cols + CAT_FEATURES])
@@ -118,11 +148,8 @@ class MultiTaskModel:
             out[t.replace("y_", "pred_")] = m.predict(X)
         return out
 
-    def predict_adverse_proba(self, df: pd.DataFrame):
-        """P(IFR-or-worse) from the category classifier's class probabilities —
-        the model's probabilistic forecast for the Brier/BSS benchmark."""
-        import numpy as np
-
+    def _raw_adverse_proba(self, df: pd.DataFrame):
+        """Uncalibrated P(IFR-or-worse) from the category classifier's class probs."""
         X = self.pre.transform(df[self.numeric_cols + CAT_FEATURES])
         clf = self.clf["y_cat"]
         proba = clf.predict_proba(X)
@@ -130,6 +157,18 @@ class MultiTaskModel:
         if not adverse_idx:
             return np.zeros(len(df))
         return proba[:, adverse_idx].sum(axis=1)
+
+    def predict_adverse_proba(self, df: pd.DataFrame):
+        """Calibrated P(IFR-or-worse) — the model's probabilistic forecast for the
+        Brier/BSS benchmark. Applies the isotonic calibrator when fitted."""
+        raw = self._raw_adverse_proba(df)
+        if self.calibrator is not None:
+            return self.calibrator.predict(raw)
+        return raw
+
+    def predict_adverse_event(self, df: pd.DataFrame):
+        """Binary IFR-or-worse decision at the val-tuned threshold — drives HSS."""
+        return self.predict_adverse_proba(df) >= self.adverse_threshold
 
     def save(self, path):
         import joblib
@@ -154,20 +193,27 @@ class ModelForecaster(Forecaster):
         if feats.empty:
             return []
         preds = self.model.predict(feats)
+        # Calibrated adverse decision at the val-tuned threshold, kept consistent with
+        # the BSS/HSS operating point (an unbalanced classifier's argmax under-calls
+        # the rare adverse class).
+        adverse = self.model.predict_adverse_event(feats)
         out = []
-        for (_, row), (_, p) in zip(feats.iterrows(), preds.iterrows()):
+        for (_, row), (_, p), is_adv in zip(feats.iterrows(), preds.iterrows(), adverse):
             has_ceiling = p["pred_has_ceiling"] >= 0.5
             ceiling = float(p["pred_ceiling_ft"]) if has_ceiling else None
             vis = max(0.0, float(p["pred_vis_m"]))
-            cat = p["pred_cat"]
+            # trust the dedicated classifier head for category, but never let it
+            # disagree with an obviously worse derived category, and honour the
+            # tuned adverse threshold (downgrade to at least IFR when it fires).
+            cat = _worse(p["pred_cat"], flight_category(ceiling, vis))
+            if is_adv:
+                cat = _worse(cat, "IFR")
             prevailing = {
                 "vis_m": vis,
                 "ceiling_ft": ceiling,
                 "wind_spd_kt": max(0.0, float(p["pred_wspd"])),
                 "wind_dir_deg": _dir_from_sincos(p["pred_wdir_sin"], p["pred_wdir_cos"]),
-                # trust the dedicated classifier head for category (its training metric),
-                # but never let it disagree with an obviously worse derived category.
-                "flight_category": _worse(cat, flight_category(ceiling, vis)),
+                "flight_category": cat,
             }
             out.append(ExpectedHour(row["valid_time"].to_pydatetime(), prevailing))
         return out
@@ -187,6 +233,30 @@ def _dir_from_sincos(s, c):
     if pd.isna(s) or pd.isna(c):
         return None
     return float(np.degrees(math.atan2(s, c)) % 360)
+
+
+def _best_hss_threshold(probs, events) -> float:
+    """Threshold on calibrated P(adverse) maximizing binary HSS over (probs, events).
+
+    HSS = 2(H·CN − M·FA) / [(H+M)(M+CN) + (H+FA)(FA+CN)], swept over probability
+    quantiles. Falls back to 0.5 if no candidate separates the classes."""
+    probs = np.asarray(probs, dtype=float)
+    events = np.asarray(events, dtype=int)
+    cands = np.unique(np.quantile(probs, np.linspace(0.02, 0.98, 97)))
+    pos, neg = int(events.sum()), int(len(events) - events.sum())
+    best_t, best_hss = 0.5, -np.inf
+    for t in cands:
+        pred = probs >= t
+        hits = int(np.sum(pred & (events == 1)))
+        fa = int(np.sum(pred & (events == 0)))
+        misses, cn = pos - hits, neg - fa
+        denom = (hits + misses) * (misses + cn) + (hits + fa) * (fa + cn)
+        if denom == 0:
+            continue
+        hss = 2.0 * (hits * cn - misses * fa) / denom
+        if hss > best_hss:
+            best_hss, best_t = hss, float(t)
+    return best_t
 
 
 _RANK = {"LIFR": 0, "IFR": 1, "MVFR": 2, "VFR": 3}

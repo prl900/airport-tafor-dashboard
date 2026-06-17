@@ -27,11 +27,14 @@ MODELS_DIR = DATA_DIR / "models"
 
 
 def tabular_eval(model: MultiTaskModel, df) -> dict:
-    """Vectorized test-set metrics: HSS (category), Brier/BSS (P-adverse), element MAE."""
+    """Vectorized split metrics: HSS (calibrated adverse decision), Brier/BSS
+    (calibrated P-adverse), element MAE, plus a bootstrap CI on BSS."""
     preds = model.predict(df)
     p_adv = model.predict_adverse_proba(df)
     true_event = df["y_cat"].isin(("IFR", "LIFR")).tolist()
-    pred_event = preds["pred_cat"].isin(("IFR", "LIFR")).tolist()
+    # HSS now comes from the val-tuned adverse threshold, not the classifier argmax —
+    # decoupled from the calibrated probability that BSS scores.
+    pred_event = list(model.predict_adverse_event(df))
     outcomes = [contingency_outcome(pe, te) for pe, te in zip(pred_event, true_event)]
     events = [1 if e else 0 for e in true_event]
 
@@ -44,10 +47,33 @@ def tabular_eval(model: MultiTaskModel, df) -> dict:
         "skill": skill_scores(outcomes),
         "brier": brier_score(list(p_adv), events),
         "bss": brier_skill_score(list(p_adv), events),
+        "bss_ci": bootstrap_bss(np.asarray(p_adv, float), np.asarray(events, int)),
+        "threshold": float(model.adverse_threshold),
+        "calibrated": model.calibrator is not None,
         "mae": {"vis": mae("pred_vis_m", "y_vis_m"),
                 "ceiling": mae("pred_ceiling_ft", "y_ceiling_ft"),
                 "wind": mae("pred_wspd", "y_wspd")},
     }
+
+
+def bootstrap_bss(probs, events, n_boot: int = 500, seed: int = 0) -> dict:
+    """Bootstrap 95% CI on the test-set BSS by resampling rows. `wins` is True when
+    the CI excludes 0 on the positive side (significantly beats climatology)."""
+    n = len(events)
+    if n == 0:
+        return {"low": None, "high": None, "wins": False}
+    rng = np.random.default_rng(seed)
+    base = events.mean()
+    bs_ref = float(np.mean((base - events) ** 2)) or None
+    if not bs_ref:
+        return {"low": None, "high": None, "wins": False}
+    vals = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        bs = float(np.mean((probs[idx] - events[idx]) ** 2))
+        vals.append(1.0 - bs / bs_ref)
+    lo, hi = float(np.quantile(vals, 0.025)), float(np.quantile(vals, 0.975))
+    return {"low": lo, "high": hi, "wins": lo > 0}
 
 
 def official_bss(con, icaos=None) -> float | None:
@@ -73,11 +99,15 @@ def train_and_evaluate(con, rung, icaos=None, train_end="2024-01-01", val_end="2
     if tr.empty or te.empty:
         raise ValueError(f"empty split: train={len(tr)} test={len(te)}")
 
-    model = MultiTaskModel(rung).fit(tr)
+    # Val-gate: fit estimators on train, then fit the isotonic calibrator + adverse
+    # threshold on val. Val metrics are the selection signal; test stays frozen.
+    model = MultiTaskModel(rung).fit(tr, val_df=va)
+    val_metrics = tabular_eval(model, va) if not va.empty else None
     metrics = tabular_eval(model, te)
 
     record = {"rung": rung, "icaos": icaos, "sample_pct": sample_pct,
-              "n_train": len(tr), "n_test": len(te), "test": metrics,
+              "n_train": len(tr), "n_val": len(va), "n_test": len(te),
+              "val": val_metrics, "test": metrics,
               "reference": {"climatology_bss": 0.0, "official_bss": official_bss(con, icaos)}}
     log_experiment(record)
 

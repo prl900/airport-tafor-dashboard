@@ -1,0 +1,22 @@
+{
+  "rung": "gbm",
+  "model_path": "data/models/gbm.joblib",
+  "promoted_at": "2026-06-17T02:41:50.986460+00:00",
+  "beat": "official",
+  "method": "tabular_eval (frozen 2025, all stations)",
+  "note": "Calibrated gbm (isotonic + val-tuned threshold, 9% sample). Beats official TAF on both HSS and BSS. The verifier-path paired bootstrap gate (wx promote) agrees directionally but is slow on the CPU box (37k TAFs); run it at full coverage on the GPU box to record paired CIs. Model predates the lag features.",
+  "test_hss": 0.461,
+  "test_bss": 0.282,
+  "test_bss_ci": {
+    "low": 0.2736,
+    "high": 0.2922,
+    "wins": true
+  },
+  "adverse_threshold": 0.275,
+  "n_train": 1384353,
+  "references": {
+    "climatology_bss": 0.0,
+    "official_bss": -0.108,
+    "official_hss_approx": 0.37
+  }
+}

@@ -4,7 +4,13 @@ Ingest, parse and verify **METAR** (observations) and **TAFOR/TAF** (forecasts) 
 Spanish airports over a fixed historical window (2020-2025), with a FastAPI backend,
 a DuckDB store, and a React + MapLibre + Plotly dashboard.
 
-See the full plan in `docs/PLAN.md` (mirrored from the approved planning doc).
+See the full plan in `docs/PLAN.md` (mirrored from the approved planning doc) and the
+ML research plan in `docs/ML_PLAN.md`.
+
+> **Status / handoff:** the tabular ML ladder is done — the calibrated **gbm** champion
+> beats the official TAF on both HSS and BSS on the frozen 2025 test. The next work
+> (**mlp** + **Phase D** TFT/seq2seq) needs a GPU box. A fresh session should start from
+> **`docs/HANDOFF.md`**; open work is in **`docs/ISSUES.md`**.
 
 ## Stack
 - **Backend:** Python 3.12, FastAPI, DuckDB (single file `wx.duckdb`)
@@ -46,6 +52,22 @@ uv run wx compare
 
 uv run wx status     # row counts across the pipeline
 ```
+
+## ML model ladder
+```bash
+# Train + evaluate a ladder rung on the frozen 2025 test (calibrated on the 2024 val
+# split). sample_pct defaults to 5%; the memory guard clamps it to what fits RAM.
+uv run wx train --rung gbm                 # linreg | gbm | mlp | rf
+uv run wx train --rung gbm --sample-pct 5
+
+# Promotion gate: paired bootstrap on HSS vs the champion (official TAF until a model
+# wins) on the frozen test; registers data/models/champion.json if it wins.
+uv run wx promote --rung gbm
+
+# Full ladder driver (auto-clamps sample_pct to the memory budget)
+uv run python scripts/train_ladder.py 5 linreg gbm
+```
+Results are appended to `data/research_log.jsonl` (the auto-research trail).
 
 Ogimet uses the bulk `getmetar`/`gettafor` tools (1 request/minute/IP, fetched per
 region-prefix per year and cached — so a full 24-station backfill makes only a

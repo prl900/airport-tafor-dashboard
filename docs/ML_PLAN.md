@@ -58,9 +58,15 @@ promote` if it wins, else archive. Every experiment appended to a research log.
 Human-gated promotion initially; progressively automate HPO/ablations.
 
 ## Phases
-- **A** Causal dataset (`ai/dataset.py`) + leakage audit + frozen splits.
-- **B** Benchmark harness: champion/challenger eval (reuse `scores.py`), significance,
-  official-TAF skyline, research-log scaffold.
-- **C** Ladder rungs 1–3 as `Forecaster`s via mltrain; promote-if-better. → REVIEW
-- **D** Sequence/probabilistic (TFT etc.) + TEMPO/PROB generation.
-- **E** Auto-research controller (config queue, Optuna, ablations) + human gates.
+- **A** ✅ Causal dataset (`ai/dataset.py`) + leakage audit + frozen splits.
+  Extended with METAR-lag features (t0−1/−3/−6 h + tendencies).
+- **B** ✅ Benchmark harness: champion/challenger eval (`scores.py`), paired bootstrap
+  significance (`ai/promote.py`), official-TAF skyline, research-log scaffold.
+- **C** ✅ Ladder rungs linreg/gbm calibrated (isotonic + val-tuned threshold) — gbm is
+  champion, beats official TAF on HSS **and** BSS on frozen 2025. rf optional; **mlp
+  deferred to GPU** (sklearn MLP too slow on CPU). Key result: calibration was the
+  lever, and the feature set saturates at ~5% sample. → REVIEWED.
+- **D** ⏳ (GPU) Sequence/probabilistic (TFT/seq2seq etc.) + TEMPO/PROB generation.
+- **E** ⏳ Auto-research controller (config queue, Optuna, ablations) + human gates.
+
+> Handoff for the GPU box: **`docs/HANDOFF.md`**; open issues: **`docs/ISSUES.md`**.
