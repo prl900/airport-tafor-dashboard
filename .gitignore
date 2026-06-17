@@ -11,9 +11,9 @@ data/raw_cache/
 data/era5/
 *.duckdb
 *.duckdb.wal
-# Stale local model artifact (mlp is being retrained on the GPU box). The small
-# calibrated linreg/gbm champions stay tracked for handoff (load on clone).
-data/models/mlp.joblib
+# The small calibrated model artifacts stay tracked for handoff (load on clone):
+# linreg/gbm (sklearn), mlp (GPU PyTorch champion — needs the `dl` extra to load),
+# seq2seq (Phase-D baseline). The big duckdb/era5/raw_cache stay out (above).
 
 # Node / frontend
 frontend/node_modules/

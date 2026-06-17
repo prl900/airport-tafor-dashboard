@@ -8,8 +8,10 @@ from wx.ai.train import official_bss, train_and_evaluate
 from wx.db.connection import connect
 
 SAMPLE_PCT = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-# rungs after the sample_pct arg, else the full ladder (fast rungs first; RF last)
-RUNGS = sys.argv[2:] or ["linreg", "gbm", "mlp", "rf"]
+# rungs after the sample_pct arg, else the default ladder (fast rungs first).
+# rf is omitted: 7 depth-20 forests are memory-heavy and never beat gbm — pass it
+# explicitly (`train_ladder.py 9 rf`) if you want it. mlp is the GPU PyTorch net.
+RUNGS = sys.argv[2:] or ["linreg", "gbm", "mlp"]
 
 con = connect(read_only=True)
 

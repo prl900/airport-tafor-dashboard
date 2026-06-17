@@ -1,56 +1,73 @@
 # Open issues / roadmap
 
-Ready-to-file GitHub issues for the next phase (GPU box). Once a remote exists:
-`gh issue create --title "..." --body "..." --label "..."`. Ordered by priority.
+Ordered by priority. Updated 2026-06-17 after the GPU session (consolidation + MLP
+champion + Phase D seq2seq/TFT).
 
 ---
 
-## 1. Retrain the ladder with the new METAR-lag features
-**labels:** `ml`, `features`, `good-first-task`
+## ✅ Done this session
+- **1. Retrain ladder with lag features** — linreg/gbm retrained at 9%; effect marginal
+  (gbm BSS +0.282→+0.284), confirming tabular saturation. rf discarded.
+- **2. MLP on GPU** — `TorchMultiTaskModel` (PyTorch, `torch_models.py`); beats gbm
+  (BSS +0.311 / HSS 0.472) and is the registered champion.
+- **3. Phase D (seq2seq + TFT)** — `seq_dataset.py` + `seq_models.py` + `tft_models.py`
+  (TFT with quantile heads). Both beat official/climatology; neither beats the tabular
+  champion on BSS, but the TFT gives calibrated quantile distributions + vis MAE 287 m.
+  Tests added (49 total).
 
-The lag/tendency features (t0−1/−3/−6 h + current−lag deltas, 33→54 features) are
-implemented in `ai/dataset.py` and unit-tested, but the saved champions
-(`gbm`, `linreg`) were trained before them — `ModelForecaster` silently ignores the
-extra columns. Retrain and re-gate to measure their effect.
+---
 
-- [ ] `wx train --rung linreg` and `--rung gbm` (5% is enough; data saturates)
-- [ ] `wx promote --rung gbm` — does HSS/BSS improve significantly?
-- [ ] Update `data/research_log.jsonl` + `champion.json`; note the delta in the log.
+## 1. PROB/TEMPO generation from TFT quantiles  *(in progress)*
+**labels:** `ml`, `phase-d`, `product`
 
-## 2. Move `mlp` to the GPU (PyTorch)
-**labels:** `ml`, `gpu`, `mlp`
+Turn the TFT's per-horizon q10/q50/q90 + calibrated P(adverse) into PROB30/TEMPO
+groups — the actual probabilistic-TAF capability the quantiles unlock. Score the
+generated groups against observed exceedance.
 
-sklearn `MLPRegressor/Classifier` took ~1 h/run on the CPU box (7 nets over 776k rows)
-and was abandoned. Reimplement as a multi-task PyTorch MLP on GPU.
+## 2. Batch the promotion gate  *(in progress)*
+**labels:** `infra`, `ml`
 
-- [ ] Multi-task heads (vis/ceiling/wind regression + flight-category classification),
-      station embedding + static features (per `ML_PLAN.md`).
-- [ ] Class-aware loss for rare adverse events, **then** isotonic calibration on the
-      2024 val split (keep the calibration/threshold decoupling that fixed gbm).
-- [ ] Slot in as a `ModelForecaster`; `wx promote --rung mlp` vs the gbm champion.
+`wx promote` (verifier path) is CPU/SQL-bound: ~1.5 s/TAF × 37k TAFs × 2 forecasters =
+hours, GPU idle. Batch `build_inference_features` over all 2025 TAF-hours in one query
+and score vectorized so the paired-bootstrap gate runs in minutes. Then re-run the MLP
+gate for a verifier-path paired CI (currently promoted via tabular_eval, like gbm).
 
-## 3. Phase D — sequence / probabilistic models (TFT, seq2seq)
-**labels:** `ml`, `gpu`, `phase-d`, `epic`
+## 3. Phase D+ — more capable models (see docs/PHASE_D_ROADMAP.md)
+**labels:** `ml`, `gpu`, `phase-d`
 
-The biggest expected gain. Multi-horizon, known-future NWP + observed-past METAR,
-**quantile outputs** to drive PROB/TEMPO group generation (scored by Brier/CRPS).
+The TFT is NOT data-saturated (@25%→@40%: BSS +0.189→+0.229), so the sequence branch
+has real headroom. Concrete sub-tickets, cheapest-first:
+- **3a. LSTM seq2seq + attention** *(in progress)* — bidirectional LSTM encoder +
+  cross-attention decoder; `lstm` rung, A/B vs the GRU seq2seq.
+- **3b. Scale + HPO** — TFT data-scaling curve (40→60→max), Optuna over hidden/heads/
+  depth/dropout/lr/`cat_loss_weight`/`past_len`/`horizon`.
+- **3c. CRPS + focal loss** — CRPS as a first-class probabilistic objective; focal loss
+  for the rare adverse class.
+- **3d. DeepAR / N-HiTS / PatchTST** — stronger probabilistic/multi-horizon backbones.
+- **3e. Full TFT Variable Selection Networks** — current TFT is lite (joint GRN proj).
+- **3f. Ensemble** — stack tabular MLP/gbm (short-lead) + TFT (long-lead + distributions).
 
-- [ ] Add a `dl` extra (torch + a TFT impl, e.g. pytorch-forecasting) to `pyproject.toml`.
-- [ ] Sequence dataset adapter over the existing causal frame (windowed per station).
-- [ ] TFT baseline → N-HiTS / PatchTST / DeepAR comparisons via the promotion gate.
-- [ ] Run on the `mltrain` cluster (Ray + MLflow); register the winner.
+## 3g. Wire seq/TFT models as Forecasters for the gate
+**labels:** `ml`, `infra`, `phase-d`
+
+Seq models are scored only via the fast tabular-style eval in `train_seq.py`. Add a
+`SeqForecaster` with a batched sequence-inference path so Phase-D models run the real
+(now-batched) promotion gate. Prerequisite for promoting any Phase-D winner.
 
 ## 4. Validate Perfect-Prognosis optimism
 **labels:** `ml`, `validation`, `data`
 
-ERA5 is joined at the valid hour, so current skill is optimistic vs real forecasts.
+ERA5 is joined at the valid hour, so skill is optimistic vs real forecasts. Ingest an
+IFS/ECMWF reforecast archive (issued at T0, valid at t) and re-evaluate the champion.
 
-- [ ] Ingest an IFS/ECMWF reforecast archive (forecast issued at T0, valid at t).
-- [ ] Re-evaluate the champion with genuine-forecast NWP; quantify the optimism gap.
-
-## 5. Generalize the memory guard beyond the 15 GB dev box
+## 5. Generalize the memory guard beyond the dev box
 **labels:** `infra`, `nice-to-have`
 
-`PEAK_BYTES_PER_ROW` / `mem_fraction` are tuned for the CPU box. Auto-calibrate the
-bytes/row constant from a tiny probe build instead of a hardcoded estimate, so the
-guard is correct on any machine.
+`PEAK_BYTES_PER_ROW`/`mem_fraction` are hand-tuned. Auto-calibrate bytes/row from a tiny
+probe build so the guard is correct on any machine.
+
+## 6. First-class `wx` commands for the seq models
+**labels:** `infra`, `nice-to-have`
+
+`seq2seq`/`tft` only run via `scripts/train_seq.py`. Add `wx train-seq` so they're
+first-class alongside `wx train`/`wx promote`, and wire a seq `Forecaster` for the gate.
