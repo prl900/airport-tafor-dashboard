@@ -22,3 +22,8 @@ frontend/dist/
 # Env / secrets
 .env
 .cdsapirc
+
+# Inferior Phase-D experiment backbones (kept out of git; regenerate via train_seq)
+data/models/gru.joblib
+data/models/tcn.joblib
+data/models/transformer.joblib

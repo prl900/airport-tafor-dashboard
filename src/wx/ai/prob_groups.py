@@ -69,11 +69,25 @@ def _state(vec: np.ndarray) -> dict:
     }
 
 
+# Category-representative conditions for adverse groups. The TFT's vis/ceiling quantile
+# regression collapses to "clear" even at q10 (the rare low-vis tail isn't captured), so
+# the skill lives in the calibrated P(adverse), not the element distribution. We therefore
+# fill an adverse group's conditions from these representative values (clamped against the
+# model's own forecast) so the generated TAF is self-consistent and realistic.
+_ADVERSE_COND = {"IFR": (2500.0, 600.0), "LIFR": (700.0, 200.0)}  # (vis_m, ceiling_ft)
+
+
 def _force_adverse(state: dict) -> dict:
-    """Ensure a state reads as adverse so adverse_probability credits the group."""
-    if state["flight_category"] not in ADVERSE:
-        state = {**state, "flight_category": "IFR"}
-    return state
+    """Make a state read as adverse (category + consistent low vis/ceiling)."""
+    cat = state["flight_category"] if state["flight_category"] in ADVERSE else "IFR"
+    vis_cap, ceil_cap = _ADVERSE_COND[cat]
+    cur_ceil = state["ceiling_ft"]
+    return {
+        **state,
+        "flight_category": cat,
+        "vis_m": min(state["vis_m"], vis_cap),
+        "ceiling_ft": min(cur_ceil, ceil_cap) if cur_ceil is not None else ceil_cap,
+    }
 
 
 def hours_from_quantiles(quantiles, p_adverse, valid_hours) -> list[ExpectedHour]:
@@ -82,15 +96,18 @@ def hours_from_quantiles(quantiles, p_adverse, valid_hours) -> list[ExpectedHour
     `quantiles` (H, len(TARGET_REG), Q), `p_adverse` (H,), `valid_hours` length H."""
     out = []
     for h, vh in enumerate(valid_hours):
-        med = _state(quantiles[h, :, MEDIAN_IDX])
         commit, gtype, gprob = quantize(float(p_adverse[h]))
         prob = None
         if commit:
-            med = _force_adverse(med)
-        elif gtype is not None:
-            bad = _force_adverse(_state(quantiles[h, :, 0]))   # q10 low-vis tail
-            prob = {**bad, "probability": int(round(gprob * 100)), "group_type": gtype}
-        out.append(ExpectedHour(vh, prevailing=med, prob=prob))
+            # firm adverse commitment: use the q10 bad-case CONDITIONS (low vis/ceiling)
+            # so the prevailing state is internally consistent (not "vis 10km, cat LIFR").
+            prevailing = _force_adverse(_state(quantiles[h, :, 0]))
+        else:
+            prevailing = _state(quantiles[h, :, MEDIAN_IDX])     # clear median
+            if gtype is not None:
+                bad = _force_adverse(_state(quantiles[h, :, 0]))  # q10 low-vis tail
+                prob = {**bad, "probability": int(round(gprob * 100)), "group_type": gtype}
+        out.append(ExpectedHour(vh, prevailing=prevailing, prob=prob))
     return out
 
 
