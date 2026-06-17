@@ -116,6 +116,88 @@ def _build_lstm_net(n_stations, emb_dim, hidden, dropout, bidirectional, attenti
     return _LSTMSeq2Seq()
 
 
+def _build_tcn_net(n_stations, emb_dim, hidden, dropout, levels=(1, 2, 4)):
+    """TCN backbone: dilated causal convolutions encode the past (exponentially
+    growing receptive field, no recurrence), then a GRU decodes the known-future
+    covariates from the encoded context. Same heads/contract as the GRU seq2seq."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class CausalConv(nn.Module):
+        def __init__(self, c, dilation):
+            super().__init__()
+            self.pad = 2 * dilation              # (kernel 3 - 1) * dilation
+            self.conv = nn.Conv1d(c, c, 3, dilation=dilation)
+            self.drop = nn.Dropout(dropout)
+
+        def forward(self, x):                    # x: (B, C, L)
+            return self.drop(F.relu(self.conv(F.pad(x, (self.pad, 0)))))
+
+    class _TCN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(n_stations, emb_dim)
+            self.static = nn.Sequential(
+                nn.Linear(len(STATIC_FEATURES) + emb_dim, hidden), nn.ReLU(), nn.Dropout(dropout))
+            self.in_proj = nn.Conv1d(len(PAST_FEATURES), hidden, 1)
+            self.blocks = nn.ModuleList(CausalConv(hidden, d) for d in levels)
+            self.dec_init = nn.Linear(hidden * 2, hidden)
+            self.decoder = nn.GRU(len(FUTURE_FEATURES), hidden, batch_first=True)
+            self.reg_head = nn.Linear(hidden, len(TARGET_REG))
+            self.cat_head = nn.Linear(hidden, N_CAT)
+
+        def forward(self, x_past, x_future, x_static, sid):
+            ctx = self.static(torch.cat([x_static, self.emb(sid)], dim=1))
+            h = self.in_proj(x_past.transpose(1, 2))     # (B, hidden, K)
+            for blk in self.blocks:
+                h = h + blk(h)                           # residual dilated causal conv
+            enc = h[:, :, -1]                            # last timestep summary (B, hidden)
+            h0 = torch.tanh(self.dec_init(torch.cat([enc, ctx], dim=1))).unsqueeze(0)
+            dec_out, _ = self.decoder(x_future, h0)
+            return self.reg_head(dec_out), self.cat_head(dec_out)
+
+    return _TCN()
+
+
+def _build_transformer_net(n_stations, emb_dim, hidden, dropout, n_heads, layers=2):
+    """Transformer encoder-decoder backbone: self-attention over the past (memory),
+    causal-masked cross-attention decoder over the known-future covariates. Static
+    context is added to every token. Distinct from the TFT (no GRN / variable selection)."""
+    import torch
+    import torch.nn as nn
+
+    class _TF(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(n_stations, emb_dim)
+            self.static = nn.Sequential(
+                nn.Linear(len(STATIC_FEATURES) + emb_dim, hidden), nn.ReLU(), nn.Dropout(dropout))
+            self.past_in = nn.Linear(len(PAST_FEATURES), hidden)
+            self.fut_in = nn.Linear(len(FUTURE_FEATURES), hidden)
+            self.pos_past = nn.Parameter(torch.zeros(1, 64, hidden))
+            self.pos_fut = nn.Parameter(torch.zeros(1, 64, hidden))
+            enc_layer = nn.TransformerEncoderLayer(hidden, n_heads, hidden * 2, dropout,
+                                                   batch_first=True)
+            dec_layer = nn.TransformerDecoderLayer(hidden, n_heads, hidden * 2, dropout,
+                                                   batch_first=True)
+            self.encoder = nn.TransformerEncoder(enc_layer, layers)
+            self.decoder = nn.TransformerDecoder(dec_layer, layers)
+            self.reg_head = nn.Linear(hidden, len(TARGET_REG))
+            self.cat_head = nn.Linear(hidden, N_CAT)
+
+        def forward(self, x_past, x_future, x_static, sid):
+            ctx = self.static(torch.cat([x_static, self.emb(sid)], dim=1)).unsqueeze(1)
+            K, H = x_past.shape[1], x_future.shape[1]
+            mem = self.encoder(self.past_in(x_past) + self.pos_past[:, :K] + ctx)
+            tgt = self.fut_in(x_future) + self.pos_fut[:, :H] + ctx
+            mask = torch.triu(torch.ones(H, H, device=tgt.device, dtype=torch.bool), 1)
+            dec_out = self.decoder(tgt, mem, tgt_mask=mask)
+            return self.reg_head(dec_out), self.cat_head(dec_out)
+
+    return _TF()
+
+
 class SeqForecastModel:
     """Seq2seq with a MultiTaskModel-style calibration contract.
 
@@ -149,11 +231,17 @@ class SeqForecastModel:
     # --- helpers --------------------------------------------------------------
     def _make_net(self):
         """Build the net for this rung's cell type (defaults preserve old pickles)."""
-        if getattr(self, "cell", "gru") == "lstm":
+        cell = getattr(self, "cell", "gru")
+        if cell == "lstm":
             return _build_lstm_net(self.n_stations, self.emb_dim, self.hidden, self.dropout,
                                    getattr(self, "bidirectional", False),
                                    getattr(self, "attention", False),
                                    getattr(self, "n_heads", 4))
+        if cell == "tcn":
+            return _build_tcn_net(self.n_stations, self.emb_dim, self.hidden, self.dropout)
+        if cell == "transformer":
+            return _build_transformer_net(self.n_stations, self.emb_dim, self.hidden,
+                                          self.dropout, getattr(self, "n_heads", 4))
         return _build_net(self.n_stations, self.emb_dim, self.hidden, self.dropout)
 
     def _standardize_targets(self, batch):

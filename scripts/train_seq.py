@@ -17,12 +17,16 @@ from wx.ai.train import MODELS_DIR, bootstrap_bss, official_bss
 
 
 def build_seq_model(rung: str):
-    """Rungs: seq2seq (GRU), lstm (biLSTM + cross-attention), tft (attention+quantiles)."""
+    """Backbone sweep — all share the dataset, heads, calibration and eval:
+    seq2seq/gru (GRU), lstm (biLSTM + cross-attn), tcn (dilated causal convs),
+    transformer (encoder-decoder), tft (attention + quantiles)."""
     if rung == "tft":
         return TFTModel(rung)
     if rung == "lstm":
         return SeqForecastModel(rung, cell="lstm", bidirectional=True, attention=True)
-    return SeqForecastModel(rung)
+    if rung in ("tcn", "transformer"):
+        return SeqForecastModel(rung, cell=rung)
+    return SeqForecastModel(rung, cell="gru")
 from wx.db.connection import connect
 from wx.verification.scores import (
     brier_score,

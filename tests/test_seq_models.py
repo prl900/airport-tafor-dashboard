@@ -76,14 +76,20 @@ def test_save_load_roundtrip_is_exact(splits, model, tmp_path):
     assert np.max(np.abs(p - m2.predict_adverse_proba(te))) == 0.0
 
 
-def test_lstm_attention_variant(splits, tmp_path):
-    """The biLSTM + cross-attention rung fits, predicts, and round-trips."""
+@pytest.mark.parametrize("cell,kw", [
+    ("lstm", {"bidirectional": True, "attention": True, "n_heads": 2}),
+    ("tcn", {}),
+    ("transformer", {"n_heads": 2}),
+])
+def test_backbone_variants(splits, tmp_path, cell, kw):
+    """Each recent-architecture backbone fits, predicts a valid (N,H) probability,
+    and round-trips through save/load."""
     tr, va, te = splits
-    m = SeqForecastModel("lstm", cell="lstm", bidirectional=True, attention=True,
-                         hidden=32, emb_dim=4, n_heads=2, max_epochs=2, batch_size=256).fit(tr, val=va)
+    m = SeqForecastModel(cell, cell=cell, hidden=32, emb_dim=4,
+                         max_epochs=2, batch_size=256, **kw).fit(tr, val=va)
     p = m.predict_adverse_proba(te)
     assert p.shape == (len(te.t0), te.y_reg.shape[1])
     assert (0.0 <= p).all() and (p <= 1.0).all()
-    path = tmp_path / "lstm.joblib"
+    path = tmp_path / f"{cell}.joblib"
     m.save(path)
     assert np.max(np.abs(p - SeqForecastModel.load(path).predict_adverse_proba(te))) == 0.0
