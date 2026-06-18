@@ -42,22 +42,99 @@ below instrument-flight thresholds) — the operationally critical, and rare (~3
 Full implementation: `src/wx/ai/dataset.py` (causal frame + leakage audit),
 `src/wx/ai/seq_dataset.py` (windowed sequences for the deep models).
 
-## 3. Metrics
+## 3. Verification: how TAFs and METARs are parsed, scored, and combined
 
-- **BSS** — Brier Skill Score of P(IFR-or-worse) vs the climatological base rate. The fair,
-  hedging-aware probabilistic metric; >0 beats climatology. Bootstrap CIs throughout.
-- **HSS** — Heidke Skill Score of the binary adverse decision at a validation-tuned
-  threshold (the primary categorical metric in the plan).
-- **Reliability** — agreement between forecast probability and observed frequency
-  (calibration), essential for a probabilistic product.
-- **Reference lines:** climatology (BSS = 0) and the **official TAF** (the skyline).
-  Scoring is unified through the verifier (`src/wx/verification/scores.py`).
+The benchmark is only as trustworthy as its scoring. Because a TAF (a forecast over a
+*window* with change groups) and a METAR (a point *observation*) are different objects, the
+verifier reduces both to a **common canonical state per hour** and scores them with one set
+of pure functions, so the official TAF and any model are judged identically. The pipeline
+has four stages: parse → normalize → expand & align → score & combine.
 
-A key methodological lesson: **calibration is decoupled from the decision threshold**.
-Class-weighted models discriminate well but produce poorly-scaled probabilities; isotonic
-calibration on validation plus a separately-tuned HSS threshold fixes both. (A subtle bug
-where a class-weighted classifier's raw argmax — not the calibrated decision — drove the
-forecast category cost the MLP ~0.16 HSS in the verifier path until corrected.)
+### 3.1 Parsing and normalization
+
+Raw METAR and TAF text are parsed (the `metar-taf-parser` library) and each report — and
+each TAF trend group — is reduced to the **same** `NormalizedConditions` record
+(`src/wx/parsing/normalize.py`): wind (direction, speed, gust), visibility, ceiling,
+cloud layers, weather phenomena. Normalization handles the messy conventions:
+
+- **Wind:** units coerced to knots (m/s, km/h → kt); variable direction (`VRB`) → unknown.
+- **Visibility:** metres; the ICAO `9999` code → 10 km ("10 km or more"); `CAVOK` → ≥10 km.
+- **Ceiling:** the lowest **BKN/OVC/OVX** layer height (ft), or the vertical visibility when
+  the sky is obscured. (Scattered/few layers do *not* constitute a ceiling.)
+- **Weather** (e.g. `BR`, `+RA`, `FG`) and **clouds** are recorded as structured tokens.
+
+![Parsing and normalization pipeline](figures/fig7_pipeline.png)
+
+### 3.2 The key combination: flight category = worst-of(ceiling, visibility)
+
+The single most important reduction is the **flight category**, which collapses two
+components — ceiling and visibility — into one operational state by taking the **most
+restrictive** of the two band classifications (`flight_category`). Bands (ICAO/metric):
+LIFR `< 500 ft / 1600 m`, IFR `< 1000 ft / 4800 m`, MVFR `< 3000 ft / 8000 m`, else VFR. A
+missing ceiling is treated as unlimited; with neither ceiling nor vis known the hour is
+unclassifiable. This worst-of rule is where cloud/ceiling and visibility *combine*, and it
+defines the headline event the whole benchmark optimizes: **IFR-or-worse** (IFR or LIFR).
+
+![Flight category as worst-of ceiling and visibility](figures/fig8_category_grid.png)
+
+### 3.3 Expanding a TAF to an hourly timeline, and aligning observations
+
+A parsed TAF is a set of groups: a `BASE`, instantaneous `FM` changes (full state replace),
+gradual `BECMG` transitions (merge, complete by the group's end), and `TEMPO`/`PROBxx`
+overlays. `timeline.expand` walks the validity window hour by hour, applying the
+chronological `FM`/`BECMG` transitions to produce the **prevailing** state for each hour and
+attaching any active `TEMPO`/`PROB` group as an overlay. Each forecast hour
+(`ExpectedHour`) is then matched to the **nearest METAR within ±40 min** (`align.py`);
+METARs are ~half-hourly, so each top-of-hour reliably finds its observation.
+
+![TAF expansion to an hourly timeline and observation alignment](figures/fig9_taf_timeline.png)
+
+### 3.4 Per-hour scoring of each component
+
+For every aligned (forecast hour, observation) pair `scores.score_hour` records:
+
+- **Element errors** (signed/absolute): wind speed (kt), wind direction (angular degrees,
+  wrapped to ≤180°), visibility (m), ceiling (ft). These are **diagnostic MAEs** — tracked
+  but not folded into the headline metric. *Temperature is not scored:* a TAF's base carries
+  no spot temperature, and weather phenomena (`BR`/`RA`/…) are recorded but not scored
+  independently — their operational effect enters through visibility/ceiling and hence the
+  category.
+- **Categorical outcome** for the IFR-or-worse event: a 2×2 contingency
+  (hit / miss / false-alarm / correct-negative). The forecast is counted as "adverse" if
+  *any* of its prevailing/TEMPO/PROB categories is adverse — so a hedge counts as a warning.
+- **Forecast probability** `adverse_probability`: a hedge-aware P(IFR-or-worse) — `1.0` if
+  the prevailing state is adverse, else the strongest adverse overlay (PROB30 → 0.3,
+  PROB40/bare-TEMPO → 0.4). Baselines with only a prevailing state collapse to a hard 0/1.
+- **Weighted score** (0–3): a pragmatic per-hour skill that credits an exact prevailing
+  category (3), a TEMPO that captures the obs (2), a PROB that captures it (1–1.5), or an
+  off-by-one prevailing (1) — taking the best available credit.
+
+### 3.5 Combining hours into the optimized metrics
+
+Pooling the per-hour outputs over the test set yields the headline scores
+(`scores.skill_scores`):
+
+- **HSS** (Heidke Skill Score) from the contingency table — the **primary categorical
+  metric and the promotion target**; also POD, FAR, CSI, bias.
+- **BSS** (Brier Skill Score) from the `adverse_probability`/event pairs vs the
+  climatological base rate — the **probabilistic metric**; reliability (§5.3) checks its
+  calibration. Both carry bootstrap CIs.
+- The **mean weighted score** is reported as a single pragmatic combined number, but model
+  selection/promotion is decided on **HSS** (with BSS as the probabilistic view).
+
+So "everything combined into one metric" is precise: ceiling ∧ visibility combine (worst-of)
+into the flight category; the category defines the adverse event; and HSS/BSS score that
+event. Wind/element errors and temperature are reported alongside but are not part of the
+optimized objective.
+
+![Per-hour scoring combined into HSS, BSS and the weighted score](figures/fig10_scoring.png)
+
+A key methodological lesson sits inside this machinery: **calibration is decoupled from the
+decision threshold**. Class-weighted models discriminate well but produce poorly-scaled
+probabilities; isotonic calibration on validation plus a separately-tuned HSS threshold
+fixes both. A subtle bug where a class-weighted classifier's raw argmax — not the calibrated
+decision — drove the forecast category cost the MLP ~0.16 HSS in the verifier path until
+corrected.
 
 ## 4. Models tested
 

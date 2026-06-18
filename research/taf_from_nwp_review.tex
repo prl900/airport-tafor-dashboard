@@ -47,13 +47,66 @@ $-1/-3/-6$\,h, with tendencies); ERA5 at $t$ and $T_0$ and the $T_0\!\to\!t$ ten
 temporal and blocked: train $<2024$, validation $=2024$, frozen test $=2025$; calibration is
 fit on validation only.
 
-\section{Metrics}
-\textbf{BSS} (Brier Skill Score of $P(\text{IFR-or-worse})$ vs climatology; hedging-aware,
-bootstrap CIs); \textbf{HSS} (categorical skill of the adverse decision at a
-validation-tuned threshold); \textbf{reliability} (calibration). References: climatology
-(BSS\,$=0$) and the official TAF (skyline). A key lesson: calibration (isotonic on
-validation) is decoupled from the decision threshold; the raw class-weighted argmax must not
-drive the forecast category.
+\section{Verification: how TAFs and METARs are parsed, scored, and combined}
+A TAF (a forecast over a window with change groups) and a METAR (a point observation) are
+different objects, so the verifier reduces both to a common canonical state per hour and
+scores them with one set of pure functions --- the official TAF and any model are judged
+identically. Four stages: parse $\to$ normalize $\to$ expand \& align $\to$ score \& combine.
+
+\subsection{Parsing and normalization}
+Raw text is parsed (\texttt{metar-taf-parser}) and each report and each TAF trend group is
+reduced to the same \texttt{NormalizedConditions} record: wind (dir/speed/gust),
+visibility, ceiling, clouds, weather. Normalization coerces units to knots (m/s, km/h);
+maps ICAO \texttt{9999} and \texttt{CAVOK} to $\geq 10$\,km visibility; and computes the
+ceiling as the lowest BKN/OVC/OVX layer height (or vertical visibility when obscured).
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.95\linewidth]{fig7_pipeline.pdf}
+\caption{Parsing/normalization: identical canonical state for observations and TAF groups.}
+\end{figure}
+
+\subsection{The key combination: flight category $=$ worst-of(ceiling, visibility)}
+The flight category collapses ceiling and visibility into one operational state by taking
+the most restrictive of the two band classifications: LIFR $<500$\,ft$/1600$\,m,
+IFR $<1000$\,ft$/4800$\,m, MVFR $<3000$\,ft$/8000$\,m, else VFR. This worst-of rule is where
+cloud/ceiling and visibility \emph{combine}, and it defines the headline event the benchmark
+optimizes: \textbf{IFR-or-worse}.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.56\linewidth]{fig8_category_grid.pdf}
+\caption{Flight category as the worst-of ceiling and visibility bands.}
+\end{figure}
+
+\subsection{Expanding a TAF to an hourly timeline, and aligning observations}
+A TAF's groups (BASE; instantaneous FM; gradual BECMG; TEMPO/PROB overlays) are walked hour
+by hour to produce a prevailing state plus any active TEMPO/PROB overlay per hour
+(\texttt{ExpectedHour}); each hour is matched to the nearest METAR within $\pm 40$\,min.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.95\linewidth]{fig9_taf_timeline.pdf}
+\caption{TAF group expansion to an hourly timeline and nearest-observation alignment.}
+\end{figure}
+
+\subsection{Per-hour scoring and combination}
+For each aligned pair the verifier records element errors (wind speed/direction, visibility,
+ceiling --- diagnostic MAEs; temperature is not scored, as a TAF base carries none); a 2$\times$2
+categorical contingency for IFR-or-worse (the forecast counts as adverse if \emph{any} of
+its prevailing/TEMPO/PROB categories is adverse); a hedge-aware probability
+(\texttt{adverse\_probability}: prevailing adverse $\to 1.0$, else PROB30 $\to 0.3$,
+PROB40/TEMPO $\to 0.4$); and a pragmatic $0$--$3$ weighted score. Pooled over the test set
+these give \textbf{HSS} (primary categorical metric and promotion target; plus POD/FAR/CSI),
+\textbf{BSS} (probabilistic, with reliability checking calibration), and a mean weighted
+score. Thus ceiling $\wedge$ visibility combine into the category, the category defines the
+adverse event, and HSS/BSS score it; wind and temperature are reported but not optimized.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.98\linewidth]{fig10_scoring.pdf}
+\caption{Per-hour scoring combined into HSS, BSS and the weighted score.}
+\end{figure}
+
+A methodological lesson lives here: calibration (isotonic on validation) is decoupled from
+the decision threshold; a bug where a class-weighted classifier's raw argmax --- not the
+calibrated decision --- drove the forecast category cost the MLP $\sim$0.16 HSS until fixed.
 
 \section{Models tested}
 Baselines (persistence, climatology, official TAF); a tabular ladder (linear, gradient
