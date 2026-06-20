@@ -91,14 +91,18 @@ def store_raw_taf(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
 
 
 def store_nwp_points(con: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
-    """Upsert ERA5 per-station point series into nwp_point. Returns rows written."""
+    """Upsert per-station NWP point series (ERA5 analysis or IFS forecast) into
+    nwp_point. Records must carry ref_time/step_h (ERA5: ref_time=valid_time, step_h=0;
+    IFS: run init time + lead). Returns rows written."""
     if not records:
         return 0
-    cols = ["icao", "valid_time", "source", "wind10m_spd", "wind10m_dir", "gust",
-            "t2m_c", "d2m_c", "tcc", "lcc", "mcc", "hcc", "cbh_m", "tp_mm", "mslp_hpa"]
+    cols = ["icao", "valid_time", "source", "ref_time", "step_h",
+            "wind10m_spd", "wind10m_dir", "gust",
+            "t2m_c", "d2m_c", "tcc", "lcc", "mcc", "hcc", "cbh_m", "tp_mm", "mslp_hpa",
+            "cape_jkg", "blh_m", "tcwv_kgm2", "skt_c"]
     df = pd.DataFrame(records, columns=cols)
     return _insert_select(con, "nwp_point", df, ", ".join(cols), cols,
-                          key_cols=["icao", "valid_time", "source"])
+                          key_cols=["icao", "valid_time", "source", "ref_time", "step_h"])
 
 
 # --- parse stage -----------------------------------------------------------

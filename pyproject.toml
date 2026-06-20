@@ -25,6 +25,9 @@ nwp = [
     "cdsapi>=0.7",
     "xarray>=2024.10",
     "netCDF4>=1.7",
+    "ecmwf-api-client>=1.6",   # TIGGE historical IFS forecasts (ECMWFDataServer)
+    "cfgrib>=0.9",             # read GRIB2 (TIGGE + ECMWF Open Data / Feed A1)
+    "eccodeslib>=2.47",        # bundled ecCodes C library cfgrib links against
 ]
 ml = [
     "scikit-learn>=1.5",

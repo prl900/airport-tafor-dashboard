@@ -92,9 +92,16 @@ def official_bss(con, icaos=None) -> float | None:
 
 
 def train_and_evaluate(con, rung, icaos=None, train_end="2024-01-01", val_end="2025-01-01",
-                       leads=LEADS_DEFAULT, sample_pct=5, save=True) -> dict:
-    """Fit `rung` on train (<train_end), evaluate on the frozen test split (>=val_end)."""
-    df = build_samples(con, icaos=icaos, leads=leads, sample_pct=sample_pct)
+                       leads=LEADS_DEFAULT, sample_pct=5, save=True,
+                       nwp_source="era5") -> dict:
+    """Fit `rung` on train (<train_end), evaluate on the frozen test split (>=val_end).
+
+    ``nwp_source`` selects the NWP feature source: 'era5' analysis is the optimistic
+    perfect-prognosis setup; 'ifs' uses genuine forecasts. Non-era5 models are saved under
+    a source-suffixed name (e.g. gbm_ifs.joblib) so the ERA5-PP champion is preserved for
+    the optimism-gap comparison."""
+    df = build_samples(con, icaos=icaos, leads=leads, sample_pct=sample_pct,
+                       nwp_source=nwp_source)
     tr, va, te = temporal_split(df, train_end=train_end, val_end=val_end)
     if tr.empty or te.empty:
         raise ValueError(f"empty split: train={len(tr)} test={len(te)}")
@@ -105,7 +112,7 @@ def train_and_evaluate(con, rung, icaos=None, train_end="2024-01-01", val_end="2
     val_metrics = tabular_eval(model, va) if not va.empty else None
     metrics = tabular_eval(model, te)
 
-    record = {"rung": rung, "icaos": icaos, "sample_pct": sample_pct,
+    record = {"rung": rung, "icaos": icaos, "sample_pct": sample_pct, "nwp_source": nwp_source,
               "n_train": len(tr), "n_val": len(va), "n_test": len(te),
               "val": val_metrics, "test": metrics,
               "reference": {"climatology_bss": 0.0, "official_bss": official_bss(con, icaos)}}
@@ -113,5 +120,6 @@ def train_and_evaluate(con, rung, icaos=None, train_end="2024-01-01", val_end="2
 
     if save:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        model.save(MODELS_DIR / f"{rung}.joblib")
+        suffix = "" if nwp_source == "era5" else f"_{nwp_source}"
+        model.save(MODELS_DIR / f"{rung}{suffix}.joblib")
     return record

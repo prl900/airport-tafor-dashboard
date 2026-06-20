@@ -84,3 +84,14 @@ def test_extract_timeseries_single_point_subset():
     assert recs[0]["wind10m_dir"] in (pytest.approx(0.0), pytest.approx(360.0))
     assert recs[0]["lcc"] is None  # not in the timeseries subset
     assert recs[0]["cbh_m"] == 100.0
+
+
+def test_era5_records_are_zero_lead_forecasts():
+    """ERA5 analysis is stored as a degenerate forecast: ref_time = valid_time,
+    step_h = 0. This lets nwp_point carry both analysis and IFS forecasts, and keeps
+    the era5 feature join bit-identical after the forecast dimension was added."""
+    ds = _synthetic_dataset()
+    recs = extract_points(ds, [{"icao": "LEMD", "lat": 40.5, "lon": -3.5}])
+    r = recs[0]
+    assert r["step_h"] == 0
+    assert r["ref_time"] == r["valid_time"]

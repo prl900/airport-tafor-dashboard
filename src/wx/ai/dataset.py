@@ -109,8 +109,12 @@ def check_memory_budget(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=No
         )
     return est
 
+# NWP fields pulled into the feature frame (both the et=valid-hour and e0=anchor rows).
+# Low/medium/high cloud layers (lcc/mcc/hcc) are included alongside total cloud (tcc):
+# the layer split — especially low cloud — improves ceiling/category (TAFOR) skill.
 _ERA5_FIELDS = ("wind10m_spd", "wind10m_dir", "gust", "t2m_c", "d2m_c",
-                "tcc", "cbh_m", "tp_mm", "mslp_hpa")
+                "tcc", "lcc", "mcc", "hcc", "cbh_m", "tp_mm", "mslp_hpa",
+                "cape_jkg", "blh_m", "tcwv_kgm2", "skt_c")
 
 # Lagged-METAR history: the recent trajectory of the Markov state. All anchored at
 # observed_at <= T0 - lag (strictly causal). Tendencies (current - lag) capture
@@ -139,7 +143,8 @@ def _lag_joins() -> str:
 
 def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
                   sample_pct: int | None = None, mem_guard: bool = True,
-                  mem_fraction: float = DEFAULT_MEM_FRACTION) -> pd.DataFrame:
+                  mem_fraction: float = DEFAULT_MEM_FRACTION,
+                  nwp_source: str = "era5") -> pd.DataFrame:
     """Build the causal sample frame from the DB (metar_obs targets + nwp_point).
 
     ``sample_pct`` (1-100) keeps a reproducible hash-based subset of target obs —
@@ -181,7 +186,7 @@ def build_samples(con, icaos=None, leads=LEADS_DEFAULT, start=None, end=None,
     )
     SELECT g.y_vis_m, g.y_ceiling_ft, g.y_wspd, g.y_wdir, g.y_cat,
            {_RAW_SELECT}
-    {_JOINS}
+    {_joins(nwp_source)}
     """
     df = con.execute(sql, params).df()
     return engineer(df, with_targets=True)
@@ -201,22 +206,58 @@ _RAW_SELECT = f"""
            {_era5_cols('e0', 'e0')},
            s.elevation_m, s.lat, s.lon, s.region
 """
-_JOINS = f"""
-    FROM grid g
-    ASOF LEFT JOIN metar_obs a
-        ON a.icao = g.icao AND a.observed_at <= g.t0
-{_lag_joins()}
+def _nwp_joins(source: str) -> str:
+    """The two NWP feature joins (alias ``et`` at the valid hour, ``e0`` at the T0
+    anchor), selected per source:
+
+    - ``era5``: analysis is keyed on valid_time alone (one value per hour). Since
+      ERA5 rows are stored as zero-lead forecasts (ref_time=valid_time, step_h=0),
+      this is also exactly the latest-run-<=-T0 / step selection, so the PP path is
+      bit-identical to before the forecast dimension was added.
+    - ``ifs`` (any forecast source): both rows must come from the SAME run
+      initialized at/just-before T0. First ASOF-pick the latest run with
+      ref_time <= T0, then ASOF-snap to the nearest available step of that run
+      (et at the valid hour, e0 at the anchor) — tolerating coarse (e.g. 3-hourly)
+      step resolution.
+    """
+    if source == "era5":
+        return """
     LEFT JOIN nwp_point et
         ON et.icao = g.icao AND et.source = 'era5'
        AND et.valid_time = date_trunc('hour', g.valid_time)
     LEFT JOIN nwp_point e0
         ON e0.icao = g.icao AND e0.source = 'era5'
        AND e0.valid_time = date_trunc('hour', g.t0)
+"""
+    return f"""
+    ASOF LEFT JOIN (
+        SELECT DISTINCT icao, ref_time FROM nwp_point WHERE source = '{source}'
+    ) run
+        ON run.icao = g.icao AND run.ref_time <= g.t0
+    ASOF LEFT JOIN nwp_point et
+        ON et.icao = g.icao AND et.source = '{source}' AND et.ref_time = run.ref_time
+       AND et.valid_time <= g.valid_time
+    ASOF LEFT JOIN nwp_point e0
+        ON e0.icao = g.icao AND e0.source = '{source}' AND e0.ref_time = run.ref_time
+       AND e0.valid_time <= g.t0
+"""
+
+
+def _joins(source: str = "era5") -> str:
+    """FROM + JOIN clause shared by training (build_samples) and inference
+    (build_inference_features) so the feature construction is identical."""
+    return f"""
+    FROM grid g
+    ASOF LEFT JOIN metar_obs a
+        ON a.icao = g.icao AND a.observed_at <= g.t0
+{_lag_joins()}
+{_nwp_joins(source)}
     JOIN stations s ON s.icao = g.icao
 """
 
 
-def build_inference_features(con, icao: str, issued_at, valid_hours) -> pd.DataFrame:
+def build_inference_features(con, icao: str, issued_at, valid_hours,
+                             nwp_source: str = "era5") -> pd.DataFrame:
     """Build the SAME causal features for explicit (icao, issued_at, valid hours),
     with no target join — used by ModelForecaster at inference time."""
     if not valid_hours:
@@ -232,7 +273,7 @@ def build_inference_features(con, icao: str, issued_at, valid_hours) -> pd.DataF
         FROM (VALUES {vh}) v(t)
     )
     SELECT {_RAW_SELECT}
-    {_JOINS}
+    {_joins(nwp_source)}
     """
     df = con.execute(sql).df()
     return engineer(df, with_targets=False)
@@ -279,17 +320,27 @@ def engineer(df: pd.DataFrame, with_targets: bool = True) -> pd.DataFrame:
     f["f_et_t2m"] = df["et_t2m_c"]
     f["f_et_spread"] = df["et_t2m_c"] - df["et_d2m_c"]
     f["f_et_tcc"] = df["et_tcc"]
+    f["f_et_lcc"] = df["et_lcc"]      # low cloud: the ceiling/fog driver
+    f["f_et_mcc"] = df["et_mcc"]
+    f["f_et_hcc"] = df["et_hcc"]
     f["f_et_cbh"] = df["et_cbh_m"]
     f["f_et_tp"] = df["et_tp_mm"]
     f["f_et_msl"] = df["et_mslp_hpa"]
+    # Candidate predictors (NULL/NaN-tolerant: all-NaN until ingested, then assessed).
+    f["f_et_cape"] = df["et_cape_jkg"]
+    f["f_et_blh"] = df["et_blh_m"]
+    f["f_et_tcwv"] = df["et_tcwv_kgm2"]
+    f["f_et_skt"] = df["et_skt_c"]
     f.update(_circular("f_et_wdir", df["et_wind10m_dir"]))
 
     # --- ERA5 T0->t tendency (the evolution signal) ---
     f["f_tend_t2m"] = df["et_t2m_c"] - df["e0_t2m_c"]
     f["f_tend_spread"] = (df["et_t2m_c"] - df["et_d2m_c"]) - (df["e0_t2m_c"] - df["e0_d2m_c"])
     f["f_tend_tcc"] = df["et_tcc"] - df["e0_tcc"]
+    f["f_tend_lcc"] = df["et_lcc"] - df["e0_lcc"]   # low-cloud build-up = ceiling lowering
     f["f_tend_msl"] = df["et_mslp_hpa"] - df["e0_mslp_hpa"]
     f["f_tend_wspd"] = df["et_wind10m_spd"] - df["e0_wind10m_spd"]
+    f["f_tend_skt"] = df["et_skt_c"] - df["e0_skt_c"]   # skin-temp drop = radiative cooling (fog)
 
     # --- lead & temporal (cyclical) ---
     f["f_lead_h"] = df["lead_h"]

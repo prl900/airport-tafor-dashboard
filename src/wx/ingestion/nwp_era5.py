@@ -45,6 +45,11 @@ ERA5_VARIABLES = {
     "cloud_base_height": "cbh",
     "total_precipitation": "tp",
     "mean_sea_level_pressure": "msl",
+    # Candidate predictors (assessed via `wx feature-importance` before operational use).
+    "convective_available_potential_energy": "cape",
+    "boundary_layer_height": "blh",
+    "total_column_water_vapour": "tcwv",
+    "skin_temperature": "skt",
 }
 
 MS_TO_KT = 1.94384
@@ -70,6 +75,39 @@ def download_year(year: int, out_dir: Path | None = None) -> Path:
             "variable": list(ERA5_VARIABLES.keys()),
             "year": str(year),
             "month": [f"{m:02d}" for m in range(1, 13)],
+            "day": [f"{d:02d}" for d in range(1, 32)],
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": [n, w, s, e],
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+        },
+        str(target),
+    )
+    return target
+
+
+def download_month(year: int, month: int, out_dir: Path | None = None) -> Path:
+    """Download one calendar month of ERA5 single-levels over Iberia. Returns path.
+
+    Monthly granules keep each CDS request under the per-request cost cap (a full year ×
+    all variables × hourly is rejected with 'cost limits exceeded'). Cached per (year, month).
+    """
+    import cdsapi
+
+    out_dir = out_dir or ERA5_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"era5_iberia_{year}{month:02d}.nc"
+    if target.exists():
+        return target
+
+    n, w, s, e = settings.era5_area
+    cdsapi.Client().retrieve(
+        DATASET,
+        {
+            "product_type": "reanalysis",
+            "variable": list(ERA5_VARIABLES.keys()),
+            "year": str(year),
+            "month": f"{month:02d}",
             "day": [f"{d:02d}" for d in range(1, 32)],
             "time": [f"{h:02d}:00" for h in range(24)],
             "area": [n, w, s, e],
@@ -170,18 +208,26 @@ def _point_records(pt: xr.Dataset, icao: str) -> list[dict]:
     cbh = series("cbh")  # metres
     tp = conv("tp", lambda a: a * 1000.0)
     msl = conv("msl", lambda a: a / 100.0)
+    cape, blh, tcwv = (series(s) for s in ("cape", "blh", "tcwv"))  # J/kg, m, kg/m^2
+    skt = conv("skt", lambda a: a - 273.15)  # K -> C
 
     records = []
     for i in range(len(times)):
+        vt = times[i].to_pydatetime().replace(tzinfo=timezone.utc)
         records.append(
             {
                 "icao": icao,
-                "valid_time": times[i].to_pydatetime().replace(tzinfo=timezone.utc),
+                "valid_time": vt,
                 "source": "era5",
+                # ERA5 analysis is a degenerate zero-lead forecast (see nwp_point schema).
+                "ref_time": vt,
+                "step_h": 0,
                 "wind10m_spd": get(spd_kt, i), "wind10m_dir": get(direction, i),
                 "gust": get(gust, i), "t2m_c": get(t2m, i), "d2m_c": get(d2m, i),
                 "tcc": get(tcc, i), "lcc": get(lcc, i), "mcc": get(mcc, i), "hcc": get(hcc, i),
                 "cbh_m": get(cbh, i), "tp_mm": get(tp, i), "mslp_hpa": get(msl, i),
+                "cape_jkg": get(cape, i), "blh_m": get(blh, i), "tcwv_kgm2": get(tcwv, i),
+                "skt_c": get(skt, i),
             }
         )
     return records

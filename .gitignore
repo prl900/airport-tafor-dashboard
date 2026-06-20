@@ -9,8 +9,12 @@ __pycache__/
 # Data (large / derived — keep out of git)
 data/raw_cache/
 data/era5/
+data/ifs/
+data/nwp/
 *.duckdb
 *.duckdb.wal
+*.grib
+*.nc
 # Stale local model artifact (mlp is being retrained on the GPU box). The small
 # calibrated linreg/gbm champions stay tracked for handoff (load on clone).
 data/models/mlp.joblib

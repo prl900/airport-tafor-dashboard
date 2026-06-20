@@ -127,7 +127,7 @@ def nwp(
     from datetime import timedelta
 
     from wx.ingestion.nwp_era5 import (
-        download_station_timeseries, download_year, extract_points,
+        download_month, download_station_timeseries, extract_points,
         extract_timeseries, load_dataset,
     )
 
@@ -152,13 +152,73 @@ def nwp(
                 total += ins
                 console.print(f"  ERA5 ts {st['icao']}: {len(recs)} rows, {ins} new")
         else:
-            for year in range(t0.year, t1.year + 1):
-                console.print(f"  ERA5 {year}: downloading (CDS queue may take minutes)…")
-                ds = load_dataset(download_year(year))
+            # Monthly granules: a full-year all-variable request exceeds the CDS cost cap.
+            month = datetime(t0.year, t0.month, 1, tzinfo=timezone.utc)
+            while month < t1:
+                console.print(f"  ERA5 {month:%Y-%m}: downloading (CDS queue may take minutes)…")
+                ds = load_dataset(download_month(month.year, month.month))
                 recs = [r for r in extract_points(ds, stations) if t0 <= r["valid_time"] < t1]
                 total += repo.store_nwp_points(con, recs)
-                console.print(f"  ERA5 {year}: {len(recs)} point-rows")
+                console.print(f"  ERA5 {month:%Y-%m}: {len(recs)} point-rows")
+                month = datetime(month.year + (month.month // 12),
+                                 (month.month % 12) + 1, 1, tzinfo=timezone.utc)
     console.print(f"[green]Stored[/] {total} nwp_point rows.")
+
+
+@app.command(name="nwp-ifs")
+def nwp_ifs(
+    start: str = typer.Option(..., help="ISO date, inclusive (first run init day)"),
+    end: str = typer.Option(..., help="ISO date, exclusive (last run init day)"),
+    source: str = typer.Option("tigge", "--source",
+                               help="historical IFS source: 'tigge' (ECMWF API) | 'cds'"),
+    dataset: str = typer.Option(None, "--dataset",
+                                help="CDS dataset id (required when --source cds)"),
+    cycles: str = typer.Option("0,12", help="comma-separated run init hours, e.g. 0,12"),
+    max_step: int = typer.Option(30, help="max lead hour to request (covers LEADS_DEFAULT)"),
+    step_every: int = typer.Option(1, help="step spacing in hours (1 hourly, 3 three-hourly)"),
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+) -> None:
+    """Download historical IFS forecasts into nwp_point as source='ifs'.
+
+    One granule per run init (date x cycle); each lead step becomes a forecast row keyed by
+    (ref_time, step_h). 'tigge' uses the ECMWF API (needs ~/.ecmwfapirc + TIGGE licence;
+    cloud layers / cbh / gust / blh are absent from TIGGE). 'cds' needs a confirmed
+    --dataset id (the free CDS does not host the operational HRES archive)."""
+    from datetime import timedelta
+
+    from wx.ingestion.nwp_ifs import (
+        download_ifs, download_tigge, extract_points_fc, load_dataset, load_grib,
+    )
+
+    t0, t1 = _utc(start), _utc(end)
+    cyc = [int(c) for c in cycles.split(",") if c.strip() != ""]
+    steps = list(range(0, max_step + 1, step_every))
+    if source == "cds" and not dataset:
+        console.print("[red]--dataset is required when --source cds[/]")
+        raise typer.Exit(code=1)
+    with get_connection() as con:
+        all_st = [
+            dict(zip(("icao", "lat", "lon"), row))
+            for row in con.execute("SELECT icao, lat, lon FROM stations").fetchall()
+        ]
+        stations = [s for s in all_st if not station or s["icao"] in station]
+        total = runs = 0
+        day = t0
+        while day < t1:
+            for hh in cyc:
+                ref = day.replace(hour=hh, minute=0, second=0, microsecond=0)
+                console.print(f"  IFS[{source}] {ref:%Y-%m-%d %HZ}: downloading…")
+                if source == "tigge":
+                    ds = load_grib(download_tigge(ref, steps))
+                else:
+                    ds = load_dataset(download_ifs(ref, steps, dataset=dataset))
+                recs = extract_points_fc(ds, stations, ref)
+                ins = repo.store_nwp_points(con, recs)
+                total += ins
+                runs += 1
+                console.print(f"  IFS[{source}] {ref:%Y-%m-%d %HZ}: {len(recs)} rows, {ins} new")
+            day += timedelta(days=1)
+    console.print(f"[green]Stored[/] {total} IFS nwp_point rows from {runs} runs.")
 
 
 @app.command()
@@ -198,6 +258,8 @@ def train(
     sample_pct: int = typer.Option(5, help="%% of target obs to sample (dense grid is ~22M)"),
     train_end: str = typer.Option("2024-01-01", help="train < this <= val"),
     val_end: str = typer.Option("2025-01-01", help="val < this <= frozen test"),
+    nwp_source: str = typer.Option("era5", "--nwp-source",
+                                   help="NWP feature source: era5 (perfect-prognosis) | ifs (forecast)"),
 ) -> None:
     """Train a model-ladder rung; evaluate on the frozen test split vs the references."""
     from wx.ai.train import train_and_evaluate
@@ -205,7 +267,8 @@ def train(
     with get_connection(read_only=True) as con:
         try:
             rec = train_and_evaluate(con, rung, icaos=station or None, sample_pct=sample_pct,
-                                     train_end=train_end, val_end=val_end)
+                                     train_end=train_end, val_end=val_end,
+                                     nwp_source=nwp_source)
         except MemoryError as exc:
             # The dataset memory guard refused this sample_pct (would OOM this box).
             console.print(f"[red]aborted:[/] {exc}")
@@ -226,6 +289,58 @@ def train(
                       + (" and the official TAF" if off is not None and t["bss"] > off else ""))
     else:
         console.print("  → does not yet beat climatology (BSS<=0)")
+
+
+@app.command(name="feature-importance")
+def feature_importance(
+    rung: str = typer.Option("gbm", help="rung to fit for the assessment"),
+    station: list[str] = typer.Option(None, "--station", help="ICAO(s); default = all"),
+    sample_pct: int = typer.Option(5, help="%% of target obs to sample"),
+    nwp_source: str = typer.Option("era5", "--nwp-source", help="era5 | ifs"),
+    ablate: bool = typer.Option(False, "--ablate",
+                                help="also run leave-one-group-out ablation (retrains per group)"),
+    repeats: int = typer.Option(3, help="permutation repeats"),
+) -> None:
+    """Rank NWP predictors by the skill they contribute, to decide operational inclusion.
+
+    Permutation importance (cheap) shuffles each variable group on the frozen test split;
+    --ablate additionally retrains without each group. A group flagged all_nan has no
+    ingested data yet — fetch it (gridded mode for cloud layers / candidates) to assess."""
+    from wx.ai.dataset import LEADS_DEFAULT, build_samples, temporal_split
+    from wx.ai.importance import ablation, permutation_importance
+    from wx.ai.models import MultiTaskModel
+
+    with get_connection(read_only=True) as con:
+        df = build_samples(con, icaos=station or None, leads=LEADS_DEFAULT,
+                           sample_pct=sample_pct, nwp_source=nwp_source)
+        tr, va, te = temporal_split(df)
+        if tr.empty or te.empty:
+            console.print(f"[red]empty split[/] train={len(tr)} test={len(te)}")
+            raise typer.Exit(code=1)
+        model = MultiTaskModel(rung).fit(tr, val_df=va)
+        imp = permutation_importance(model, te, n_repeats=repeats)
+
+        table = Table(title=f"Permutation importance ({nwp_source}, {rung}, test split)")
+        for c in ("group", "ΔHSS", "Δmae_vis", "Δmae_ceil", "data?"):
+            table.add_column(c)
+        fnum = lambda v, d=4: f"{v:.{d}f}" if v is not None else "—"
+        for _, r in imp.iterrows():
+            table.add_row(r["group"], fnum(r["d_hss"]), fnum(r["d_mae_vis"], 0),
+                          fnum(r["d_mae_ceiling"], 0),
+                          "[red]none[/]" if r["all_nan"] else "yes")
+        console.print(table)
+        console.print("ΔHSS > 0 = variable helps (shuffling it lost skill). "
+                      "Δmae > 0 = error rose when removed.")
+
+        if ablate:
+            abl = ablation(con, rung=rung, icaos=station or None, sample_pct=sample_pct,
+                           nwp_source=nwp_source)
+            t2 = Table(title="Leave-one-group-out ablation (retrained)")
+            for c in ("group", "HSS", "ΔHSS_vs_full"):
+                t2.add_column(c)
+            for _, r in abl.iterrows():
+                t2.add_row(r["group"], fnum(r["hss"]), fnum(r["d_hss"]))
+            console.print(t2)
 
 
 @app.command()

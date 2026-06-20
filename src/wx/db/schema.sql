@@ -139,13 +139,19 @@ CREATE TABLE IF NOT EXISTS verification_hourly (
 );
 
 -- ---------------------------------------------------------------------------
--- NWP point series extracted per station from ERA5 (Phase 3).
--- Dedup key: (icao, valid_time, source).
+-- NWP point series extracted per station, from ERA5 analysis or IFS forecast.
+-- Dedup key: (icao, valid_time, source, ref_time, step_h).
+--   ERA5 analysis is stored as a degenerate zero-lead forecast:
+--     ref_time = valid_time, step_h = 0.
+--   IFS forecast rows carry the run init time (ref_time) and lead (step_h),
+--   so ref_time + step_h = valid_time. Many rows share a valid_time across runs.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS nwp_point (
     icao          VARCHAR NOT NULL,
     valid_time    TIMESTAMPTZ NOT NULL,
-    source        VARCHAR NOT NULL,           -- 'era5'
+    source        VARCHAR NOT NULL,           -- 'era5' | 'ifs'
+    ref_time      TIMESTAMPTZ,                -- model init/cycle time (= valid_time for era5)
+    step_h        INTEGER,                    -- lead in hours (0 for era5); ref_time + step_h = valid_time
     wind10m_spd   DOUBLE,
     wind10m_dir   DOUBLE,
     gust          DOUBLE,
@@ -157,5 +163,10 @@ CREATE TABLE IF NOT EXISTS nwp_point (
     hcc           DOUBLE,
     cbh_m         DOUBLE,
     tp_mm         DOUBLE,
-    mslp_hpa      DOUBLE
+    mslp_hpa      DOUBLE,
+    -- Candidate predictors (nullable; populated when ingested, NULL-tolerant otherwise).
+    cape_jkg      DOUBLE,                      -- convective available potential energy (TS/gust risk)
+    blh_m         DOUBLE,                      -- boundary-layer height (fog/stratus formation, mixing)
+    tcwv_kgm2     DOUBLE,                      -- total column water vapour (moisture precursor)
+    skt_c         DOUBLE                       -- skin temperature (overnight radiative cooling -> radiation fog)
 );

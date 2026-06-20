@@ -39,10 +39,28 @@ def init_db(con: duckdb.DuckDBPyConnection | None = None) -> None:
     con = con or connect()
     try:
         con.execute(SCHEMA_PATH.read_text())
+        _migrate(con)
         seed_stations(con)
     finally:
         if own:
             con.close()
+
+
+def _migrate(con: duckdb.DuckDBPyConnection) -> None:
+    """Idempotent migrations for already-populated databases.
+
+    schema.sql uses CREATE TABLE IF NOT EXISTS, so column additions don't reach an
+    existing wx.duckdb — apply them here. Safe to re-run; no-ops on a fresh DB."""
+    # nwp_point gained a forecast reference dimension (ref_time, step_h). Existing
+    # ERA5 rows are backfilled as a zero-lead forecast: ref_time = valid_time, step_h = 0.
+    con.execute("ALTER TABLE nwp_point ADD COLUMN IF NOT EXISTS ref_time TIMESTAMPTZ;")
+    con.execute("ALTER TABLE nwp_point ADD COLUMN IF NOT EXISTS step_h INTEGER;")
+    con.execute(
+        "UPDATE nwp_point SET ref_time = valid_time, step_h = 0 WHERE ref_time IS NULL;"
+    )
+    # Candidate predictors (nullable; backfilled to NULL on existing rows).
+    for col in ("cape_jkg", "blh_m", "tcwv_kgm2", "skt_c"):
+        con.execute(f"ALTER TABLE nwp_point ADD COLUMN IF NOT EXISTS {col} DOUBLE;")
 
 
 def seed_stations(con: duckdb.DuckDBPyConnection) -> None:
