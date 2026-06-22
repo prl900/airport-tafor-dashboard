@@ -13,18 +13,20 @@ controls for which hours are intrinsically hard.
 
 from __future__ import annotations
 
+import bisect
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
+from wx.ai.dataset import build_inference_features_batch
 from wx.ai.evaluate import bootstrap_hss_diff, log_experiment
 from wx.ai.generate import Forecaster, OfficialForecaster
-from wx.ai.models import ModelForecaster, MultiTaskModel
+from wx.ai.models import ModelForecaster, MultiTaskModel, _hourly
 from wx.config import DATA_DIR
 from wx.verification.align import align
-from wx.verification.runner import _load_obs
 from wx.verification.scores import brier_skill_score, score_hour, skill_scores
 
 MODELS_DIR = DATA_DIR / "models"
@@ -33,9 +35,68 @@ TEST_START = datetime(2025, 1, 1, tzinfo=timezone.utc)
 TEST_END = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _scored_by_hour(con, forecaster, icao, issued_at, vf, vt, obs) -> dict:
+def _batch_load_obs(con, tafs, start, end) -> dict:
+    """Load every test-window METAR once and group by station (sorted), so each TAF's
+    obs window is a bisect slice instead of one SQL query per TAF (~37k queries)."""
+    icaos = sorted({t[0] for t in tafs})
+    if not icaos:
+        return {}
+    cols = ("observed_at", "wind_dir_deg", "wind_spd_kt", "vis_m", "ceiling_ft", "flight_category")
+    rows = con.execute(
+        f"SELECT icao, {', '.join(cols)} FROM metar_obs "
+        f"WHERE icao IN ({','.join(['?'] * len(icaos))}) AND observed_at >= ? AND observed_at < ? "
+        "ORDER BY icao, observed_at",
+        [*icaos, start, end],
+    ).fetchall()
+    by_icao: dict = {}
+    for r in rows:
+        by_icao.setdefault(r[0], ([], []))  # (times, obs dicts)
+        by_icao[r[0]][0].append(r[1])
+        by_icao[r[0]][1].append(dict(zip(cols, r[1:])))
+    return by_icao
+
+
+def _obs_window(obs_index, icao, vf, vt) -> list:
+    """Slice the pre-loaded obs for one TAF window [vf, vt) via bisect."""
+    pack = obs_index.get(icao)
+    if not pack:
+        return []
+    times, obs = pack
+    return obs[bisect.bisect_left(times, vf):bisect.bisect_left(times, vt)]
+
+
+def _model_hour_lookups(con, forecasters, tafs) -> dict:
+    """Per ModelForecaster, a {(icao, t0_ns, valid_ns): ExpectedHour} map built from a
+    SINGLE batched feature frame over every TAF-hour. This replaces ~1.5 s of per-TAF
+    ASOF SQL per forecaster with one batched build the models share — the gate's
+    bottleneck. Non-model forecasters (official/persistence) fall back to generate()."""
+    model_fcs = {id(f): f for f in forecasters if isinstance(f, ModelForecaster)}
+    if not model_fcs:
+        return {}
+    triples = [(icao, issued_at, h)
+               for icao, issued_at, vf, vt in tafs for h in _hourly(vf, vt)]
+    feats = build_inference_features_batch(con, triples)
+    lookups = {}
+    if feats.empty:
+        return {fid: {} for fid in model_fcs}
+    icaos = feats["icao"].tolist()
+    t0_ns = [int(t.value) for t in feats["t0"]]
+    vt_ns = [int(t.value) for t in feats["valid_time"]]
+    for fid, fc in model_fcs.items():
+        hours = fc.hours_from_feats(feats)
+        lookups[fid] = {(icaos[i], t0_ns[i], vt_ns[i]): eh for i, eh in enumerate(hours)}
+    return lookups
+
+
+def _scored_by_hour(con, forecaster, icao, issued_at, vf, vt, obs, lookups) -> dict:
     """{valid_hour: score_hour dict} for one forecaster over one TAF window."""
-    expected = forecaster.generate(con, icao, issued_at, vf, vt)
+    fid = id(forecaster)
+    if fid in lookups:                       # batched model path: assemble from the lookup
+        lk, t0n = lookups[fid], int(pd.Timestamp(issued_at).value)
+        expected = [lk[(icao, t0n, int(pd.Timestamp(h).value))]
+                    for h in _hourly(vf, vt) if (icao, t0n, int(pd.Timestamp(h).value)) in lk]
+    else:
+        expected = forecaster.generate(con, icao, issued_at, vf, vt)
     if not expected:
         return {}
     scored = {}
@@ -63,14 +124,20 @@ def evaluate_paired(con: duckdb.DuckDBPyConnection, champion: Forecaster,
         params,
     ).fetchall()
 
+    # Build the shared causal features for every TAF-hour once (batched), so the gate
+    # is no longer ~1.5 s of ASOF SQL per TAF per forecaster.
+    lookups = _model_hour_lookups(con, [champion, challenger], tafs)
+    # ...and load all obs once (one query) instead of ~37k per-TAF window queries.
+    obs_index = _batch_load_obs(con, tafs, start, end)
+
     champ_out, chal_out = [], []
     champ_probs, chal_probs, events = [], [], []
     for icao, issued_at, vf, vt in tafs:
-        obs = _load_obs(con, icao, vf, vt)
+        obs = _obs_window(obs_index, icao, vf, vt)
         if not obs:
             continue
-        a = _scored_by_hour(con, champion, icao, issued_at, vf, vt, obs)
-        b = _scored_by_hour(con, challenger, icao, issued_at, vf, vt, obs)
+        a = _scored_by_hour(con, champion, icao, issued_at, vf, vt, obs, lookups)
+        b = _scored_by_hour(con, challenger, icao, issued_at, vf, vt, obs, lookups)
         for h in sorted(a.keys() & b.keys()):     # only hours both verified
             champ_out.append(a[h]["category_outcome"])
             chal_out.append(b[h]["category_outcome"])

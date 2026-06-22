@@ -238,6 +238,34 @@ def build_inference_features(con, icao: str, issued_at, valid_hours) -> pd.DataF
     return engineer(df, with_targets=False)
 
 
+def build_inference_features_batch(con, requests) -> pd.DataFrame:
+    """Batched ``build_inference_features``: features for MANY (icao, issued_at,
+    valid_time) triples in one query, via the identical _RAW_SELECT/_JOINS. Used by the
+    promotion gate so the shared causal features are built once for all TAF-hours
+    (champion and challenger reuse them) instead of one slow ASOF query per TAF."""
+    requests = list(requests)
+    if not requests:
+        return pd.DataFrame()
+    req = pd.DataFrame(requests, columns=["icao", "t0", "valid_time"])
+    req["t0"] = pd.to_datetime(req["t0"], utc=True)
+    req["valid_time"] = pd.to_datetime(req["valid_time"], utc=True)
+    con.register("_infer_reqs", req)
+    try:
+        sql = f"""
+        WITH grid AS (
+            SELECT icao, t0, valid_time,
+                   CAST(date_diff('hour', t0, valid_time) AS INTEGER) AS lead_h
+            FROM _infer_reqs
+        )
+        SELECT {_RAW_SELECT}
+        {_JOINS}
+        """
+        df = con.execute(sql).df()
+    finally:
+        con.unregister("_infer_reqs")
+    return engineer(df, with_targets=False)
+
+
 def engineer(df: pd.DataFrame, with_targets: bool = True) -> pd.DataFrame:
     """Add derived features (f_*) and (optionally) targets (y_*); drop anchorless rows."""
     if df.empty:

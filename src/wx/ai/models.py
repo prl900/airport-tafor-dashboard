@@ -192,30 +192,41 @@ class ModelForecaster(Forecaster):
         feats = build_inference_features(con, icao, issued_at, hours)
         if feats.empty:
             return []
+        return self.hours_from_feats(feats)
+
+    def hours_from_feats(self, feats) -> list[ExpectedHour]:
+        """Turn a (possibly batched, multi-issue) causal feature frame into one
+        ExpectedHour per row. The gate builds `feats` once and calls this per model.
+
+        Column-vectorized (no per-row ``iterrows``) so it scales to the ~1M TAF-hours
+        the batched promotion gate evaluates."""
         preds = self.model.predict(feats)
-        # Calibrated adverse decision at the val-tuned threshold, kept consistent with
-        # the BSS/HSS operating point (an unbalanced classifier's argmax under-calls
-        # the rare adverse class).
-        adverse = self.model.predict_adverse_event(feats)
+        # CALIBRATED adverse decision (isotonic + val-tuned threshold) — the single
+        # source of truth for the IFR-or-worse event, NOT the raw class-weighted argmax
+        # (which over-calls adverse and would bypass the calibration the ladder needs).
+        adverse = np.asarray(self.model.predict_adverse_event(feats))
+        vis = np.maximum(0.0, preds["pred_vis_m"].to_numpy(float))
+        ceil = preds["pred_ceiling_ft"].to_numpy(float)
+        has_ceil = preds["pred_has_ceiling"].to_numpy(float) >= 0.5
+        wspd = np.maximum(0.0, preds["pred_wspd"].to_numpy(float))
+        wdir = _dir_from_sincos_arr(preds["pred_wdir_sin"].to_numpy(float),
+                                    preds["pred_wdir_cos"].to_numpy(float))
+        vts = list(feats["valid_time"])
         out = []
-        for (_, row), (_, p), is_adv in zip(feats.iterrows(), preds.iterrows(), adverse):
-            has_ceiling = p["pred_has_ceiling"] >= 0.5
-            ceiling = float(p["pred_ceiling_ft"]) if has_ceiling else None
-            vis = max(0.0, float(p["pred_vis_m"]))
-            # trust the dedicated classifier head for category, but never let it
-            # disagree with an obviously worse derived category, and honour the
-            # tuned adverse threshold (downgrade to at least IFR when it fires).
-            cat = _worse(p["pred_cat"], flight_category(ceiling, vis))
-            if is_adv:
-                cat = _worse(cat, "IFR")
-            prevailing = {
-                "vis_m": vis,
+        for i in range(len(vis)):
+            ceiling = float(ceil[i]) if has_ceil[i] else None
+            derived = flight_category(ceiling, float(vis[i]))
+            if adverse[i]:
+                cat = _worse(derived, "IFR")            # at least IFR; keep LIFR if worse
+            else:
+                cat = "MVFR" if derived in ("IFR", "LIFR") else derived  # never over-call
+            out.append(ExpectedHour(vts[i].to_pydatetime(), {
+                "vis_m": float(vis[i]),
                 "ceiling_ft": ceiling,
-                "wind_spd_kt": max(0.0, float(p["pred_wspd"])),
-                "wind_dir_deg": _dir_from_sincos(p["pred_wdir_sin"], p["pred_wdir_cos"]),
+                "wind_spd_kt": float(wspd[i]),
+                "wind_dir_deg": wdir[i],
                 "flight_category": cat,
-            }
-            out.append(ExpectedHour(row["valid_time"].to_pydatetime(), prevailing))
+            }))
         return out
 
 
@@ -233,6 +244,13 @@ def _dir_from_sincos(s, c):
     if pd.isna(s) or pd.isna(c):
         return None
     return float(np.degrees(math.atan2(s, c)) % 360)
+
+
+def _dir_from_sincos_arr(sin, cos):
+    """Vectorized _dir_from_sincos: list of wind dirs (None where sin/cos is NaN)."""
+    deg = np.degrees(np.arctan2(sin, cos)) % 360
+    known = ~(np.isnan(sin) | np.isnan(cos))
+    return [float(d) if k else None for d, k in zip(deg, known)]
 
 
 def _best_hss_threshold(probs, events) -> float:

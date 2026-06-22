@@ -30,6 +30,11 @@ ml = [
     "scikit-learn>=1.5",
     "joblib>=1.4",
 ]
+dl = [
+    # cu121 build: the default PyPI wheel targets CUDA 13 and refuses to init on the
+    # GPU box's 12.2 driver. Pinned to the pytorch cu121 index below (Pascal sm_61 OK).
+    "torch==2.5.1",
+]
 dev = [
     "pytest>=8.3",
     "ruff>=0.9",
@@ -37,6 +42,16 @@ dev = [
 
 [project.scripts]
 wx = "wx.pipelines.backfill:app"
+
+# torch from the pytorch cu121 index (driver 12.2 on the GPU box); only the `dl`
+# extra is affected. Drop/repin when the box's driver supports the default wheel.
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

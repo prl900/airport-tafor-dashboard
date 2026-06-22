@@ -6,6 +6,8 @@ import pandas as pd
 import pytest
 
 from wx.ai.dataset import (
+    build_inference_features,
+    build_inference_features_batch,
     build_samples,
     feature_columns,
     target_columns,
@@ -67,6 +69,19 @@ def test_lead_and_features_present(con):
     assert set(df["lead_h"].unique()) <= {1, 6, 12}
     # fog spread feature: when the anchor is the 06Z fog ob, T-Td spread is small
     assert df["f_o0_spread"].min() < 1.0
+
+
+def test_batched_inference_features_match_per_issue(con):
+    """The gate's batched feature build must be identical to per-issue builds."""
+    issued = datetime(2023, 1, 1, 12, tzinfo=UTC)
+    hours = [issued + timedelta(hours=h) for h in (1, 3, 6)]
+    single = build_inference_features(con, "LEMD", issued, hours)
+    batch = build_inference_features_batch(con, [("LEMD", issued, h) for h in hours])
+    assert len(single) == len(batch) > 0
+    fcols = feature_columns(single)
+    a = single.sort_values("valid_time")[fcols].reset_index(drop=True)
+    b = batch.sort_values("valid_time")[fcols].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
 
 
 def test_temporal_split_is_chronological(con):
