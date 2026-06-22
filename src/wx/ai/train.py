@@ -25,6 +25,21 @@ from wx.verification.scores import (
 
 MODELS_DIR = DATA_DIR / "models"
 
+# Rungs trained as a GPU PyTorch multi-task net rather than sklearn estimators.
+TORCH_RUNGS = {"mlp"}
+
+
+def build_model(rung: str):
+    """Model factory: sklearn ladder rungs vs the GPU PyTorch multi-task net.
+
+    Both expose the same MultiTaskModel surface (fit/predict/predict_adverse_*/
+    calibrator/threshold/save/load), so everything downstream is rung-agnostic."""
+    if rung in TORCH_RUNGS:
+        from wx.ai.torch_models import TorchMultiTaskModel
+
+        return TorchMultiTaskModel(rung)
+    return MultiTaskModel(rung)
+
 
 def tabular_eval(model: MultiTaskModel, df) -> dict:
     """Vectorized split metrics: HSS (calibrated adverse decision), Brier/BSS
@@ -108,7 +123,7 @@ def train_and_evaluate(con, rung, icaos=None, train_end="2024-01-01", val_end="2
 
     # Val-gate: fit estimators on train, then fit the isotonic calibrator + adverse
     # threshold on val. Val metrics are the selection signal; test stays frozen.
-    model = MultiTaskModel(rung).fit(tr, val_df=va)
+    model = build_model(rung).fit(tr, val_df=va)
     val_metrics = tabular_eval(model, va) if not va.empty else None
     metrics = tabular_eval(model, te)
 

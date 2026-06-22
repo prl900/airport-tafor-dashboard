@@ -62,11 +62,17 @@ Human-gated promotion initially; progressively automate HPO/ablations.
   Extended with METAR-lag features (t0−1/−3/−6 h + tendencies).
 - **B** ✅ Benchmark harness: champion/challenger eval (`scores.py`), paired bootstrap
   significance (`ai/promote.py`), official-TAF skyline, research-log scaffold.
-- **C** ✅ Ladder rungs linreg/gbm calibrated (isotonic + val-tuned threshold) — gbm is
-  champion, beats official TAF on HSS **and** BSS on frozen 2025. rf optional; **mlp
-  deferred to GPU** (sklearn MLP too slow on CPU). Key result: calibration was the
-  lever, and the feature set saturates at ~5% sample. → REVIEWED.
-- **D** ⏳ (GPU) Sequence/probabilistic (TFT/seq2seq etc.) + TEMPO/PROB generation.
+- **C** ✅ Ladder rungs linreg/gbm calibrated (isotonic + val-tuned threshold), then a
+  **GPU PyTorch MLP** (`torch_models.py`, shared trunk + class-aware loss + same
+  calibration) which **beats gbm and is the champion** (BSS +0.311 / HSS 0.472 on frozen
+  2025). Key results: calibration was the lever; the tabular feature set saturates at ~5%
+  sample (lag features only marginal). → REVIEWED.
+- **D** ✅ (GPU, started) Sequence/probabilistic: `seq_dataset.py` (causal windowed
+  encoder/decoder) + `seq_models.py` (GRU seq2seq) + `tft_models.py` (**TFT with quantile
+  heads**, pinball loss, masked attention). Both beat official/climatology; neither beats
+  the tabular champion on adverse BSS (seq2seq +0.211, TFT +0.219 at matched leads), but
+  the TFT gives **calibrated quantile distributions** (82.8% coverage) + better vis MAE —
+  the foundation for PROB/TEMPO products. Next: PROB/TEMPO generation, HPO, CRPS.
 - **E** ⏳ Auto-research controller (config queue, Optuna, ablations) + human gates.
 
 > Handoff for the GPU box: **`docs/HANDOFF.md`**; open issues: **`docs/ISSUES.md`**.

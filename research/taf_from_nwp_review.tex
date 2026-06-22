@@ -1,0 +1,168 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+\graphicspath{{figures/}}
+\captionsetup{font=small}
+
+\title{Generating Probabilistic Aerodrome Forecasts (TAFs) from\\
+Numerical Weather Prediction: A Benchmark-Driven Model Review}
+\author{Spanish airport network, 2020--2025}
+\date{Working review}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study whether machine learning can produce skilful, well-calibrated aerodrome forecasts
+(TAFs) from numerical weather prediction (NWP) and recent observations, and beat the
+official human-issued TAF. Using a strictly causal feature frame over 24 Spanish airports
+(2.5\,M METARs, 0.25\,M TAFs; ERA5 reanalysis as a perfect-prognosis NWP proxy), we
+benchmark a ladder of tabular models and a family of sequence/probabilistic models (GRU,
+LSTM, Transformer, TCN, and a Temporal Fusion Transformer with quantile outputs) on a
+frozen 2025 test set. The best model is a logistic \emph{stacked ensemble} of
+\{MLP, gradient boosting, TFT\} reaching \textbf{BSS $+0.348$ / HSS $0.513$}, versus the
+official TAF's $-0.108$, and it is near-perfectly calibrated. Driving PROB/TEMPO group
+generation with it yields an operational TAF at BSS $+0.215$. Architecture is \emph{not}
+the limiting factor: data scaling, model class, and the available feature set all plateau
+near BSS\,$\approx +0.33$, indicating a data ceiling set by the ingested NWP fields and the
+perfect-prognosis setup.
+\end{abstract}
+
+\section{Objective}
+Predict, from information available at issue time $T_0$, the hourly aerodrome state over the
+TAF validity window \emph{probabilistically}, so the model can be scored fairly against the
+official TAF and drive automatic PROB/TEMPO change-group generation. The headline event is
+\textbf{IFR-or-worse} (sub-instrument ceiling/visibility) --- operationally critical and
+rare ($\sim$3.6\%).
+
+\section{Data and setup}
+Targets are METAR-derived vis, ceiling, wind and flight category at valid time $t$. Features
+are strictly causal (enforced structurally): current and lagged METAR state ($t_0$,
+$-1/-3/-6$\,h, with tendencies); ERA5 at $t$ and $T_0$ and the $T_0\!\to\!t$ tendency
+(perfect-prognosis NWP); lead time; cyclical hour/day; static airport attributes. Splits are
+temporal and blocked: train $<2024$, validation $=2024$, frozen test $=2025$; calibration is
+fit on validation only.
+
+\section{Verification: how TAFs and METARs are parsed, scored, and combined}
+A TAF (a forecast over a window with change groups) and a METAR (a point observation) are
+different objects, so the verifier reduces both to a common canonical state per hour and
+scores them with one set of pure functions --- the official TAF and any model are judged
+identically. Four stages: parse $\to$ normalize $\to$ expand \& align $\to$ score \& combine.
+
+\subsection{Parsing and normalization}
+Raw text is parsed (\texttt{metar-taf-parser}) and each report and each TAF trend group is
+reduced to the same \texttt{NormalizedConditions} record: wind (dir/speed/gust),
+visibility, ceiling, clouds, weather. Normalization coerces units to knots (m/s, km/h);
+maps ICAO \texttt{9999} and \texttt{CAVOK} to $\geq 10$\,km visibility; and computes the
+ceiling as the lowest BKN/OVC/OVX layer height (or vertical visibility when obscured).
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.95\linewidth]{fig7_pipeline.pdf}
+\caption{Parsing/normalization: identical canonical state for observations and TAF groups.}
+\end{figure}
+
+\subsection{The key combination: flight category $=$ worst-of(ceiling, visibility)}
+The flight category collapses ceiling and visibility into one operational state by taking
+the most restrictive of the two band classifications: LIFR $<500$\,ft$/1600$\,m,
+IFR $<1000$\,ft$/4800$\,m, MVFR $<3000$\,ft$/8000$\,m, else VFR. This worst-of rule is where
+cloud/ceiling and visibility \emph{combine}, and it defines the headline event the benchmark
+optimizes: \textbf{IFR-or-worse}.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.56\linewidth]{fig8_category_grid.pdf}
+\caption{Flight category as the worst-of ceiling and visibility bands.}
+\end{figure}
+
+\subsection{Expanding a TAF to an hourly timeline, and aligning observations}
+A TAF's groups (BASE; instantaneous FM; gradual BECMG; TEMPO/PROB overlays) are walked hour
+by hour to produce a prevailing state plus any active TEMPO/PROB overlay per hour
+(\texttt{ExpectedHour}); each hour is matched to the nearest METAR within $\pm 40$\,min.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.95\linewidth]{fig9_taf_timeline.pdf}
+\caption{TAF group expansion to an hourly timeline and nearest-observation alignment.}
+\end{figure}
+
+\subsection{Per-hour scoring and combination}
+For each aligned pair the verifier records element errors (wind speed/direction, visibility,
+ceiling --- diagnostic MAEs; temperature is not scored, as a TAF base carries none); a 2$\times$2
+categorical contingency for IFR-or-worse (the forecast counts as adverse if \emph{any} of
+its prevailing/TEMPO/PROB categories is adverse); a hedge-aware probability
+(\texttt{adverse\_probability}: prevailing adverse $\to 1.0$, else PROB30 $\to 0.3$,
+PROB40/TEMPO $\to 0.4$); and a pragmatic $0$--$3$ weighted score. Pooled over the test set
+these give \textbf{HSS} (primary categorical metric and promotion target; plus POD/FAR/CSI),
+\textbf{BSS} (probabilistic, with reliability checking calibration), and a mean weighted
+score. Thus ceiling $\wedge$ visibility combine into the category, the category defines the
+adverse event, and HSS/BSS score it; wind and temperature are reported but not optimized.
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.98\linewidth]{fig10_scoring.pdf}
+\caption{Per-hour scoring combined into HSS, BSS and the weighted score.}
+\end{figure}
+
+A methodological lesson lives here: calibration (isotonic on validation) is decoupled from
+the decision threshold; a bug where a class-weighted classifier's raw argmax --- not the
+calibrated decision --- drove the forecast category cost the MLP $\sim$0.16 HSS until fixed.
+
+\section{Models tested}
+Baselines (persistence, climatology, official TAF); a tabular ladder (linear, gradient
+boosting, a GPU multi-task MLP); sequence models (GRU, LSTM$+$attention, Transformer, TCN);
+a TFT with quantile heads; and ensembles (linear blend, logistic stack). All deep models
+share one framework, calibration contract and evaluation.
+
+\section{Results}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.92\linewidth]{fig1_model_comparison.pdf}
+\caption{Adverse-event skill on the frozen 2025 test (9 standard leads). Every learned model
+beats the official TAF ($-0.108$); ensembling leads.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.80\linewidth]{fig6_ablation.pdf}
+\caption{Stack ablation. \{MLP, gbm, TFT\} matches the full four-model stack (LSTM is
+redundant); the TFT adds $+0.011$ over the tabular-only \{MLP, gbm\} stack.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.55\linewidth]{fig2_reliability.pdf}
+\caption{Reliability of the stacked ensemble: forecast probability matches observed
+frequency to within $\pm0.01$.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.70\linewidth]{fig3_skill_vs_lead.pdf}\\
+\includegraphics[width=0.70\linewidth]{fig5_region.pdf}
+\caption{Skill vs lead time (top) and by region (bottom) for the stacked ensemble.}
+\end{figure}
+
+\begin{figure}[H]\centering
+\includegraphics[width=0.64\linewidth]{fig4_scaling.pdf}
+\caption{TFT data-scaling: skill improves then saturates by $\sim$60\% sample.}
+\end{figure}
+
+\section{Generating PROB/TEMPO TAFs}
+The stacked $P(\text{adverse})$ is quantized to the TAF buckets (none / PROB30 / PROB40 /
+firm) and combined with the TFT quantile element forecast to emit an hourly timeline with
+PROB/TEMPO groups. The regenerated operational TAF scores BSS $+0.215$ (vs $-0.108$). The
+TFT's visibility quantiles collapse to ``clear'' even at $q_{10}$, so adverse skill lives in
+the calibrated category probability, not the element distribution; adverse groups use
+category-representative conditions.
+
+\section{Discussion and limitations}
+Data volume, architecture and feature set all plateau near BSS\,$\approx +0.33$ --- a data
+ceiling, not a modelling one. ERA5's cloud-layer split (the obvious ceiling/fog predictor)
+was never ingested. The perfect-prognosis setup makes absolute skill optimistic; validation
+against a genuine IFS/ECMWF reforecast is the credibility milestone. The highest-value next
+step is richer / genuine-forecast NWP, not a larger network.
+
+\section{Conclusion}
+A calibrated, stacked ensemble of complementary model classes produces aerodrome forecasts
+substantially more skilful and better calibrated than the official TAF
+(BSS $+0.348$ vs $-0.108$) and drives a competitive operational PROB/TEMPO TAF.
+
+\end{document}

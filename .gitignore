@@ -15,9 +15,9 @@ data/nwp/
 *.duckdb.wal
 *.grib
 *.nc
-# Stale local model artifact (mlp is being retrained on the GPU box). The small
-# calibrated linreg/gbm champions stay tracked for handoff (load on clone).
-data/models/mlp.joblib
+# The small calibrated model artifacts stay tracked for handoff (load on clone):
+# linreg/gbm (sklearn), mlp (GPU PyTorch champion — needs the `dl` extra to load),
+# seq2seq (Phase-D baseline). The big duckdb/era5/ifs/nwp/raw_cache stay out (above).
 
 # Node / frontend
 frontend/node_modules/
@@ -26,3 +26,13 @@ frontend/dist/
 # Env / secrets
 .env
 .cdsapirc
+
+# Inferior Phase-D experiment backbones (kept out of git; regenerate via train_seq)
+data/models/gru.joblib
+data/models/tcn.joblib
+data/models/transformer.joblib
+
+# LaTeX build artifacts
+research/*.aux
+research/*.log
+research/*.out

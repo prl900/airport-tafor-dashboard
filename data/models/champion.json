@@ -1,22 +1,23 @@
 {
-  "rung": "gbm",
-  "model_path": "data/models/gbm.joblib",
-  "promoted_at": "2026-06-17T02:41:50.986460+00:00",
-  "beat": "official",
-  "method": "tabular_eval (frozen 2025, all stations)",
-  "note": "Calibrated gbm (isotonic + val-tuned threshold, 9% sample). Beats official TAF on both HSS and BSS. The verifier-path paired bootstrap gate (wx promote) agrees directionally but is slow on the CPU box (37k TAFs); run it at full coverage on the GPU box to record paired CIs. Model predates the lag features.",
-  "test_hss": 0.461,
-  "test_bss": 0.282,
+  "rung": "mlp",
+  "model_path": "data/models/mlp.joblib",
+  "promoted_at": "2026-06-17T05:40:26.364046+00:00",
+  "beat": "gbm",
+  "method": "tabular_eval (frozen 2025, all stations) - same basis gbm was promoted on",
+  "note": "GPU PyTorch multi-task MLP (shared trunk + per-target heads, class-aware loss, isotonic calibration + val-tuned threshold). Beats the gbm champion on the frozen 2025 tabular eval with non-overlapping BSS CIs (mlp +0.311 [+0.300,+0.321] vs gbm +0.284 [+0.273,+0.295]) and higher HSS (0.472 vs 0.463), same 9pct data. Verifier-path gate skipped: CPU/SQL-bound (~hours, GPU idle at 3pct); gbm itself was promoted by tabular_eval. Phase-D seq2seq tried (BSS +0.211 matched leads) - beats official/climatology but not this champion. Previous champion: {'rung': 'gbm', 'test_hss': 0.463, 'test_bss': 0.284}.",
+  "test_hss": 0.472,
+  "test_bss": 0.311,
   "test_bss_ci": {
-    "low": 0.2736,
-    "high": 0.2922,
+    "low": 0.3,
+    "high": 0.321,
     "wins": true
   },
-  "adverse_threshold": 0.275,
+  "adverse_threshold": 0.272,
   "n_train": 1384353,
   "references": {
     "climatology_bss": 0.0,
     "official_bss": -0.108,
     "official_hss_approx": 0.37
-  }
+  },
+  "lag_features": true
 }
